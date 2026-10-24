@@ -1,0 +1,53 @@
+<meta charset="utf-8">
+<title>环域星体模型</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<!--@FONTS-->
+<!--@STYLE-->
+<!-- 页面模板（spec/03 第十节第 2 条、附录 B）：不写 doctype／html／head／body；只放空容器与静态标题，卡片内部由各模块生成 -->
+<div id="app" class="app" data-view="ov" data-panel="1" data-chrome="1">
+  <main id="stage" class="stage">
+    <canvas id="gl" aria-label="三维视图"></canvas>
+    <div id="labels" class="labels" aria-hidden="true"></div>
+    <div id="fpHud" class="fp-hud" hidden></div>
+    <header id="topbar" class="topbar chrome">
+      <h1 class="title">环域星体模型</h1>
+      <div id="viewSwitch" class="seg" role="group" aria-label="视图"></div>
+      <div id="ovPresets" class="presets" role="group" aria-label="总览预设"></div>
+      <div id="nowChips" class="chips" role="group" aria-label="此刻"></div>
+    </header>
+    <div id="legend" class="legend chrome"></div>
+    <div id="ovNote" class="ov-note chrome"></div>
+    <div id="ovCaption" class="ov-caption" role="status" aria-live="polite" hidden></div>
+    <div id="busy" class="busy" role="status" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <div id="fallback" class="fallback" hidden></div>
+    <div id="chromeBtn" class="chrome-btn"></div>
+    <div id="fade" class="fade" aria-hidden="true"></div>
+  </main>
+  <section id="timebar" class="timebar chrome" aria-label="时间"></section>
+  <aside id="panel" class="panel chrome" aria-label="侧栏">
+    <nav id="tabs" class="tabs" aria-label="侧栏页签"></nav>
+    <div id="tab-site" class="tabpage" role="tabpanel" aria-labelledby="tabbtn-site">
+      <section id="siteCard" class="card"></section>
+      <section id="readouts" class="card"></section>
+      <section class="card"><h3>天空</h3><canvas id="cSky" class="chart chart-sky"></canvas></section>
+      <section class="card"><h3>一日</h3><canvas id="cDay" class="chart chart-day"></canvas></section>
+      <section class="card"><h3>本月月相</h3><canvas id="cMonth" class="chart chart-month"></canvas></section>
+    </div>
+    <div id="tab-year" class="tabpage" role="tabpanel" aria-labelledby="tabbtn-year" hidden>
+      <section class="card"><h3>一年</h3><canvas id="cYear" class="chart chart-year"></canvas></section>
+      <section class="card"><h3>日月高度</h3><canvas id="cHelix" class="chart chart-helix"></canvas></section>
+      <section class="card"><h3>子午线剖面</h3><canvas id="cMerid" class="chart chart-merid"></canvas></section>
+      <section id="calendar" class="card"></section>
+    </div>
+    <div id="tab-params" class="tabpage" role="tabpanel" aria-labelledby="tabbtn-params" hidden>
+      <div id="params"></div>
+    </div>
+    <div id="tab-notes" class="tabpage" role="tabpanel" aria-labelledby="tabbtn-notes" hidden>
+      <div id="notes"></div>
+    </div>
+  </aside>
+</div>
+<!--@CDN-->
+<!--@SCRIPTS-->

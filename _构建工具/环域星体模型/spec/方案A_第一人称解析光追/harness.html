@@ -1,0 +1,1630 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>方案A 着色器试验台</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#ddd;font:12px/1.4 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+#hud{position:fixed;left:8px;top:8px;background:rgba(0,0,0,.55);padding:6px 8px;border-radius:4px;white-space:pre;pointer-events:none;max-width:60vw}
+</style></head><body>
+<canvas id="c"></canvas><div id="hud"></div>
+<script id="glsl-common" type="x-shader">// =====================================================================================
+//  环域星体 · 第一人称写实渲染（方案 A：单个全屏片元着色器解析光追）—— 公共库  GLSL ES 3.00
+//  单位：长度 km，角度 rad；辐亮度 cd/m²，照度 lux（太阳强度 uSunI = 照度×km²，按 1/d² 衰减）。
+//  世界坐标（与天体模块一致）：原点＝星体球心；+y＝塔轴指向塔顶，塔根极在 (0,-R,0)；xz＝塔腰平面；
+//  经度自 +x 量向 +z，增大方向＝自转方向＝本地“西”。观察点本地：上 U＝垂直指向塔轴，北 N＝(0,-1,0)，东 E＝N×U。
+//  精度约定：float32 在 6371 km 处只有 ~0.4 m 分辨率，所以凡是“离地多高”的量（地形、眼高）都用
+//  相机相对的稳定差分（dRxz / dRho），绝对量由 CPU 用双精度算好、以 uniform 传入。
+// =====================================================================================
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+precision highp sampler3D;
+
+#define PI  3.14159265359
+#define INF 1e30
+
+// ---------------- 质量档（JS 以 #define 注入；不同档编译不同程序） ----------------
+#ifndef Q_ATM_NEAR
+#define Q_ATM_NEAR 14        // 视线上升段（相机→真空核）样本
+#endif
+#ifndef Q_ATM_FAR
+#define Q_ATM_FAR 10         // 视线下降段（真空核→对面内壁）样本
+#endif
+#ifndef Q_TER_STEPS
+#define Q_TER_STEPS 96       // 近处高度场步进上限
+#endif
+#ifndef Q_NEAR_KM
+#define Q_NEAR_KM 80.0       // 近场高度场的最远距离
+#endif
+#ifndef Q_SHADOW_STEPS
+#define Q_SHADOW_STEPS 20
+#endif
+#ifndef Q_CLOUD_STEPS
+#define Q_CLOUD_STEPS 32
+#endif
+#ifndef Q_CLOUD_LIGHT
+#define Q_CLOUD_LIGHT 4
+#endif
+
+// ---------------- uniform ----------------
+uniform vec2  uRes;            // 本 pass 渲染分辨率
+uniform vec2  uJitter;         // TAA 子像素抖动（像素）
+uniform int   uFrame;
+uniform float uClock;          // 秒（云流动）
+// 相机
+uniform vec3  uCamPos;         // 相机世界坐标（已 fround；下面各量由 CPU 用这个舍入值、双精度算出）
+uniform vec3  uCamRight, uCamUp, uCamFwd;
+uniform float uTanHalfFov;
+uniform float uCamC0;          // |P|² − R²
+uniform float uCamRho;         // |P|
+uniform float uCamR0;          // |P.xz|（离塔轴）
+uniform float uCamAltS;        // R + trench(yP) − |P|           球面模式：相机离基准面
+uniform float uCamAltT;        // rb(yP) − r0                     阶地模式：相机离阶地基准面
+uniform float uRsphP;          // sqrt(R² − yP²)
+uniform float uCamFy;          // fract(yP / W)
+uniform float uTrenchP;        // trench(yP)
+uniform vec3  uFrameE, uFrameN, uFrameU;
+uniform vec2  uLayerOrg[5];    // 各层地形噪声在相机处的纹理坐标（CPU 取模，避免大数）
+uniform float uZoneAmp;        // 相机所在域的地形起伏系数
+uniform vec4  uZoneW;          // 相机所在域权重：x 轻域 y 平域 z 重域 w 罪域
+uniform float uLimboW;         // 相机处灵薄带权重
+uniform float uClearMax;       // 近场地形相对宏观球面的最大可能高出（km）
+uniform float uLip;            // 位移场的坡度上界（CPU 由各层幅度/尺度估算）
+// 星体
+uniform float uR, uA, uGEq, uGLight, uGHeavy, uLimboKm;
+// 日月
+uniform vec3  uSunPos;   uniform float uSunRad;  uniform vec3 uSunI;
+uniform vec3  uMoonPos;  uniform float uMoonRad; uniform float uMoonAlb;
+uniform mat3  uMoonBasis;                       // 月面本体系（列：朝塔轴、朝塔顶、切向）
+uniform vec3  uMoonW0;   uniform mat3 uMoonW1;  // 壁照：E(n) = W0 + W1·n （lux）
+uniform vec3  uMoonE;                           // 月光在观察点的照度（大气外；CPU 解析）
+uniform float uMoonD2;                          // 观察点到月心距离²
+// 大气
+uniform float uAtmoOn;
+uniform vec3  uBetaR;          // 瑞利散射 @壁面（1/km）
+uniform float uBetaM, uBetaMA; // 米氏散射 / 吸收 @壁面
+uniform float uHR, uHM, uMieG, uHcut;
+uniform float uRainBeta;       // 罪域云底以下的雨雾附加消光
+uniform vec3  uAmbK;           // 远壁天光 / 直射（CPU 由光学厚度估算）
+uniform float uVeilK;          // 可选“静滞暗幕”：真空核内的灰吸收（1/km），0＝纯物理
+uniform sampler2D uMSLut;      // 32×32 多重散射
+uniform sampler2D uSkySH;      // 9×1：观察点天空辐亮度的 SH9（上一帧）
+// 地形
+uniform int   uGroundMode;     // 0 顺球面斜坡；1 水平阶地 + 朝南（背塔根）一侧落差的崖
+uniform float uTerW, uHcS, uCliffFrac;
+uniform float uTerWig, uWigS, uW0;   // 崖线蜿蜒：幅度（踏面宽为单位）、噪声尺度（1/km）、相机处噪声值
+uniform vec2  uWigOrg;
+uniform float uCliffJit, uB0;  // 崖线细碎进退（踏面宽为单位）与相机处的该层噪声值
+uniform float uDispScale;
+uniform sampler2D uHeightTex;  // RGBA16F：R 高度[-1,1]，G/B 对 uv 的偏导，A 材质噪声
+uniform float uAbyssDepth, uAbyssHalf;
+uniform vec3  uRuiDir;  uniform float uRuiRad;
+uniform float uWet;
+// 云
+uniform float uCloudOn, uCloudBase, uCloudTop, uCloudCover, uCloudSigma, uRuiOvercast;
+uniform sampler3D uNoise3D;    // 64³ RGBA8：R Perlin-Worley，G/B/A Worley×3 频
+uniform vec3  uWind;
+// 塔与曝光
+uniform float uTowerAlb;
+uniform sampler2D uExpTex;     // 1×1：x 曝光（上一帧），y 适应亮度
+
+// =====================================================================================
+//  0. 小工具
+// =====================================================================================
+float sat(float x) { return clamp(x, 0.0, 1.0); }
+float ign(vec2 p, int f) {     // 交错梯度噪声，逐帧平移（配合 TAA 变成蓝噪声般的收敛）
+  p += float(f & 63) * 5.588238;
+  return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// =====================================================================================
+//  1. 解析求交
+// =====================================================================================
+// t² + 2bt + c = 0 的两根（数值稳定写法），无实根返回 (INF,-INF)
+vec2 iSphereBC(float b, float c) {
+  float D = b * b - c;
+  if (D < 0.0) return vec2(INF, -INF);
+  float s = sqrt(D);
+  float q = -b - (b >= 0.0 ? s : -s);
+  if (abs(q) < 1e-20) return vec2(0.0);
+  float t1 = q, t2 = c / q;
+  return vec2(min(t1, t2), max(t1, t2));
+}
+vec2 iSphere(vec3 o, vec3 d, float rad) { return iSphereBC(dot(o, d), dot(o, o) - rad * rad); }
+
+// 巨塔：沿 y 的无限长圆柱（球内部分就是 |y|<sqrt(R²−a²)，更远处必先撞内壁，故不必截断）
+float iTower(vec3 o, vec3 d) {
+  vec2 od = o.xz, dd = d.xz;
+  float A = dot(dd, dd);
+  if (A < 1e-14) return INF;
+  float B = dot(od, dd);
+  if (B >= 0.0) return INF;                       // 水平上背离塔轴
+  float cr = od.x * dd.y - od.y * dd.x;           // |od×dd|：无相消的垂距
+  float D = A * uA * uA - cr * cr;                // = A(a² − p⊥²)
+  if (D < 0.0) return INF;
+  float t = (-B - sqrt(D)) / A;
+  return t > 0.0 ? t : INF;
+}
+
+// =====================================================================================
+//  2. 遮挡：塔挡日（半影解析）、月掩日
+// =====================================================================================
+// 从 X 看半径 rho、中心 S 的发光球，露在塔外的面积比例。塔是竖直无限圆柱 → 在 X 处的剪影是
+// 方位角上的一条带 [−δ, δ]，带边是过 X 的竖直平面；日面被平面切掉的弓形面积有闭式解。
+float bodyVisTower(vec3 X, vec3 S, float rho) {
+  vec2 p = X.xz;
+  float rp2 = dot(p, p), a2 = uA * uA;
+  if (rp2 <= a2) return 0.0;
+  float rp = sqrt(rp2);
+  vec2 q = S.xz - p;
+  float Lh = length(q);
+  if (Lh < 1e-3) return 1.0;
+  vec2 c = -p / rp;                               // 水平上指向塔轴
+  float cosA = dot(q, c) / Lh;
+  if (cosA <= 0.0) return 1.0;                    // 日在背离塔的一侧
+  float sinA = abs(c.x * q.y - c.y * q.x) / Lh;
+  float sd = uA / rp, cd = sqrt(max(1.0 - sd * sd, 0.0));
+  float u = Lh * (sinA * cd - cosA * sd) / rho;   // 日心到“塔缘平面”的有符号距离 / 日半径
+  if (u >= 1.0) return 1.0;
+  if (sinA < sd) {                                // 日心视线穿塔：日在塔前就全亮
+    float tHit = rp * cosA - sqrt(max(a2 - rp2 * sinA * sinA, 0.0));
+    if (Lh < tHit) return 1.0;
+  } else if (Lh < rp * cd) return 1.0;            // 日在切点之前（塔前的边上）
+  if (u <= -1.0) return 0.0;
+  return 0.5 + (u * sqrt(1.0 - u * u) + asin(u)) / PI;
+}
+// 月掩日：两圆面重叠（角半径小，用叉积求夹角保精度）
+float occultVis(vec3 X, vec3 S, float rs, vec3 M, float rm) {
+  vec3 ds = S - X, dm = M - X;
+  float Ds = length(ds), Dm = length(dm);
+  if (Dm >= Ds) return 1.0;
+  float r1 = rs / Ds, r2 = rm / Dm;
+  float sep = length(cross(ds / Ds, dm / Dm));
+  if (dot(ds, dm) < 0.0 || sep >= r1 + r2) return 1.0;
+  if (sep <= r2 - r1) return 0.0;
+  if (sep <= r1 - r2) return 1.0 - (r2 * r2) / (r1 * r1);
+  float x = (sep * sep + r1 * r1 - r2 * r2) / (2.0 * sep);
+  float A = r1 * r1 * acos(clamp(x / r1, -1.0, 1.0)) + r2 * r2 * acos(clamp((sep - x) / r2, -1.0, 1.0))
+          - sep * sqrt(max(r1 * r1 - x * x, 0.0));
+  return 1.0 - A / (PI * r1 * r1);
+}
+
+// =====================================================================================
+//  3. 大气（瑞利 + 米氏 + 罪域雨雾；密度随“离壁高度”h＝R−|X| 指数变稀）
+// =====================================================================================
+float phaseR(float c) { return 0.0596831 * (1.0 + c * c); }
+float phaseCS(float c, float g) {
+  float g2 = g * g;
+  return 0.1193662 * (1.0 - g2) * (1.0 + c * c) / ((2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5));
+}
+float phaseHG(float c, float g) {
+  float g2 = g * g;
+  return 0.0795775 * (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5);
+}
+float ruiMask(vec3 X) {
+  float cd = dot(X / length(X), uRuiDir);
+  return smoothstep(cos(uRuiRad), cos(uRuiRad * 0.75), cd);
+}
+vec3 densities(vec3 X, float h) {
+  float hh = max(h, -3.0 * uHM);                  // 深渊底部更稠
+  vec3 r = vec3(exp(-hh / uHR), exp(-hh / uHM), 0.0);
+  if (uRainBeta > 0.0 && h < uCloudBase + 0.5) r.z = ruiMask(X) * sat((uCloudBase + 0.5 - h) / 1.0);
+  return r;
+}
+// 到日/月的透射率：日月都在“真空核”里且恒在 μ≥0.7 的方向（日离球心 ≤3250 km），平行平面近似误差 <1%
+vec3 transToward(float h, float mu) {
+  mu = max(mu, 0.05);
+  float hh = max(h, 0.0);
+  float oR = uHR * exp(-hh / uHR), oM = uHM * exp(-hh / uHM);
+  return exp(-(uBetaR * oR + (uBetaM + uBetaMA) * oM) / mu);
+}
+// 静滞暗幕：从 X 到核内天体 S 的连线在核里走过的长度 → 灰透射率
+float veilT(vec3 X, vec3 S) {
+  if (uVeilK <= 0.0) return 1.0;
+  vec3 dv = S - X; float L = length(dv);
+  vec2 c = iSphere(X, dv / L, uR - uHcut);
+  if (c.x >= c.y) return 1.0;
+  float inCore = clamp(min(c.y, L) - max(c.x, 0.0), 0.0, L);
+  return exp(-uVeilK * inCore);
+}
+vec3 msLookup(float h, float mu) {
+  vec2 uv = vec2(sqrt(sat(h / uHcut)), sat(mu));
+  return texture(uMSLut, (uv * 31.0 + 0.5) / 32.0).rgb;
+}
+// 天空 SH9（世界系方向）
+vec3 shC(int i) { return texelFetch(uSkySH, ivec2(i, 0), 0).rgb; }
+vec3 skyIrradiance(vec3 n) {
+  const float c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
+  float x = n.x, y = n.y, z = n.z;
+  vec3 e = c1 * shC(8) * (x * x - y * y) + c3 * shC(6) * z * z + c4 * shC(0) - c5 * shC(6)
+         + 2.0 * c1 * (shC(4) * x * y + shC(7) * x * z + shC(5) * y * z)
+         + 2.0 * c2 * (shC(3) * x + shC(1) * y + shC(2) * z);
+  return max(e, vec3(0.0));
+}
+vec3 skyMeanRadiance() { return max(shC(0) * 0.2820948, vec3(0.0)); }
+
+// 视线积分的“快照”：云的合成需要知道 [0, tc] 段的结果
+float gSnapT = INF;
+vec3  gSnapL = vec3(0.0), gSnapT3 = vec3(1.0);
+bool  gSnapped = false;
+
+float warpU(float u, float k, float ek) { return k < 1e-3 ? u : -log(1.0 - u * ek) / k; }
+
+// 一段 [ta,tb] 的积分。toEnd=false：样本向 ta 端加密；true：向 tb 端加密。k＝两端密度相差的 e 倍数。
+void atmoMarch(vec3 o, vec3 d, float ta, float tb, float k, bool toEnd, int n, float jit,
+               vec3 skyMean, inout vec3 Lin, inout vec3 Tr) {
+  float len = tb - ta;
+  if (len <= 1e-6 || n <= 0) return;
+  k = clamp(k, 0.0, 30.0);
+  float ek = 1.0 - exp(-k);
+  float fn = float(n);
+  for (int i = 0; i < 64; i++) {
+    if (i >= n) break;
+    float u0 = float(i) / fn, u1 = float(i + 1) / fn, um = (float(i) + jit) / fn;
+    float t0, t1, tm;
+    if (!toEnd) { t0 = ta + len * warpU(u0, k, ek); t1 = ta + len * warpU(u1, k, ek); tm = ta + len * warpU(um, k, ek); }
+    else { t0 = tb - len * warpU(1.0 - u0, k, ek); t1 = tb - len * warpU(1.0 - u1, k, ek); tm = tb - len * warpU(1.0 - um, k, ek); }
+    float dt = t1 - t0;
+    if (!gSnapped && t0 >= gSnapT) { gSnapL = Lin; gSnapT3 = Tr; gSnapped = true; }
+    vec3 X = o + d * tm;
+    float r = length(X), h = uR - r;
+    vec3 up = -X / r;
+    vec3 rho = densities(X, h);
+    vec3 sR = uBetaR * rho.x;
+    float sM = uBetaM * rho.y + 0.95 * uRainBeta * rho.z;
+    vec3 sE = sR + vec3((uBetaM + uBetaMA) * rho.y + uRainBeta * rho.z);
+    vec3 S = vec3(0.0);
+    // —— 太阳：单次散射（塔影＝体积阴影，逐样本解析）＋多次散射 LUT ——
+    vec3 Ls = uSunPos - X;
+    float ds2 = dot(Ls, Ls);
+    vec3 l = Ls * inversesqrt(ds2);
+    float vis = bodyVisTower(X, uSunPos, uSunRad);
+    if (vis > 0.0) {
+      float mu = dot(l, up), c = dot(d, l);
+      vec3 E = uSunI / ds2 * vis * veilT(X, uSunPos);
+      S += E * (transToward(h, mu) * (sR * phaseR(c) + sM * phaseCS(c, uMieG)) + (sR + sM) * msLookup(h, mu));
+    }
+    // —— 月光 ——
+    if (uMoonE.g > 1e-7) {
+      vec3 Lm = uMoonPos - X;
+      float dm2 = dot(Lm, Lm);
+      vec3 lm = Lm * inversesqrt(dm2);
+      float vm = bodyVisTower(X, uMoonPos, uMoonRad);
+      float cm = dot(d, lm);
+      S += uMoonE * (uMoonD2 / dm2) * vm * veilT(X, uMoonPos) * transToward(h, dot(lm, up)) * (sR * phaseR(cm) + sM * phaseCS(cm, uMieG));
+    }
+    // —— 塔影里的空气被“天光”（夜里主要是对面世界的白昼辉光）照亮：二次散射的廉价近似 ——
+    S += (sR + sM) * skyMean * (1.0 - vis);
+    vec3 Tst = exp(-sE * dt);
+    Lin += Tr * (S - S * Tst) / max(sE, vec3(1e-9));
+    Tr *= Tst;
+  }
+}
+
+// 整条视线 [0, tEnd]：在“最高点”切成上升段与下降段，并跳过中间近乎真空的核；
+// 每段再按霾层（5·HM）与空气层分开加密 —— 即“两端加密”的非均匀采样。
+void integrateAtmo(vec3 o, vec3 d, float tEnd, float jit, vec3 skyMean, int nNear, int nFar,
+                   out vec3 Lin, out vec3 Tr) {
+  Lin = vec3(0.0); Tr = vec3(1.0);
+  gSnapped = false;
+  if (uAtmoOn < 0.5 || tEnd <= 0.0) { gSnapL = Lin; gSnapT3 = Tr; return; }
+  tEnd = min(tEnd, 2.0 * uR);
+  float tAp = clamp(-dot(o, d), 0.0, tEnd);
+  vec2 core = iSphere(o, d, uR - uHcut);
+  float a1 = tAp, b0 = tAp;
+  if (core.x < core.y && core.y > 0.0) { a1 = min(a1, max(core.x, 0.0)); b0 = max(b0, core.y); }
+  a1 = min(a1, tEnd); b0 = min(b0, tEnd);
+  float hz = min(5.0 * uHM, uHcut * 0.5);
+  vec2 zb = iSphere(o, d, uR - hz);
+  bool zHit = zb.x < zb.y && zb.y > 0.0;
+  float z1 = zHit ? clamp(zb.x, 0.0, a1) : a1;
+  float z2 = zHit ? clamp(zb.y, b0, tEnd) : b0;
+  float h0 = uR - length(o);
+  float hz1 = uR - length(o + d * z1), ha1 = uR - length(o + d * a1);
+  float hb0 = uR - length(o + d * b0), hz2 = uR - length(o + d * z2), he = uR - length(o + d * tEnd);
+  bool hasDn = tEnd - b0 > 1e-3;
+  int nUp = hasDn ? nNear : nNear + nFar;
+  int nDn = hasDn ? nFar : 0;
+  int nUpH = (a1 - z1 > 1e-3) ? max(2, nUp * 2 / 5) : nUp;
+  int nDnH = (z2 - b0 > 1e-3) ? max(2, nDn * 2 / 5) : nDn;
+  atmoMarch(o, d, 0.0, z1, (hz1 - h0) / uHM, false, nUpH, jit, skyMean, Lin, Tr);
+  atmoMarch(o, d, z1, a1, (ha1 - hz1) / uHR, false, nUp - nUpH, jit, skyMean, Lin, Tr);
+  if (uVeilK > 0.0) {                                // 穿过真空核：暗幕（快照若落在核内也按比例）
+    float lc = max(b0 - a1, 0.0);
+    if (!gSnapped && gSnapT < b0) { gSnapL = Lin; gSnapT3 = Tr * exp(-uVeilK * max(gSnapT - a1, 0.0)); gSnapped = true; }
+    Tr *= exp(-uVeilK * lc);
+  }
+  atmoMarch(o, d, b0, z2, (hb0 - hz2) / uHR, true, nDn - nDnH, jit, skyMean, Lin, Tr);
+  atmoMarch(o, d, z2, tEnd, (hz2 - he) / uHM, true, nDnH, jit, skyMean, Lin, Tr);
+  if (!gSnapped) { gSnapL = Lin; gSnapT3 = Tr; }
+}
+
+// =====================================================================================
+//  4. 地形：基准面（球面 / 阶地）＋ 多尺度位移；全部相机相对
+// =====================================================================================
+const float TILE_FEAT = 32.0;                                   // 高度图一张平铺横跨 32 个特征
+const float LAYER_L[5] = float[5](6.0, 1.1, 0.2, 0.035, 0.006); // 各层特征尺度 km
+const float LAYER_A[5] = float[5](0.32, 0.085, 0.018, 0.0032, 0.0007); // 各层幅度 km（×域系数）
+const float LAYER_REST[5] = float[5](0.427, 0.107, 0.022, 0.0039, 0.0007); // 本层及更细各层幅度之和
+
+float dRxz(vec3 v) {                 // r(P+v) − r(P)
+  vec2 p = uCamPos.xz, w = v.xz;
+  float num = 2.0 * dot(p, w) + dot(w, w);
+  return num / (uCamR0 + sqrt(max(uCamR0 * uCamR0 + num, 0.0)));
+}
+float dRho(vec3 v) {                 // |P+v| − |P|
+  float num = 2.0 * dot(uCamPos, v) + dot(v, v);
+  return num / (uCamRho + sqrt(max(uCamRho * uCamRho + num, 0.0)));
+}
+float trench(float y) { return uAbyssDepth * (1.0 - smoothstep(uAbyssHalf * 0.55, uAbyssHalf, abs(y))); }
+float trenchD(float y) {
+  float a = uAbyssHalf * 0.55, b = uAbyssHalf, x = sat((abs(y) - a) / (b - a));
+  return -uAbyssDepth * 6.0 * x * (1.0 - x) / (b - a) * sign(y);
+}
+// 阶地锯齿：踏面上 s=f−0.5（与球面坡度相消 → 水平），f∈[1−c,1] 是崖面（陡降）
+float sawS(float f) { return (f - 0.5) - smoothstep(1.0 - uCliffFrac, 1.0, f); }
+float sawSD(float f) {
+  float a = 1.0 - uCliffFrac, x = sat((f - a) / uCliffFrac);
+  return 1.0 - 6.0 * x * (1.0 - x) / uCliffFrac;
+}
+float altSphere(vec3 v) { return uCamAltS - uTrenchP - dRho(v); }   // 相对半径 R 的宏观球面（不含深渊，用于“已高过一切地形”的判断）
+vec2 tanCoord(vec3 v) { return vec2(dot(v, uFrameE), dot(v, uFrameN)); }
+// 阶地相位：phase = y/W + wig·w(地表, 15 km 级) + jit·b(地表, 1 km 级)；f = fract(phase)
+// 前者让崖线蜿蜒、踏面宽窄不一；后者让崖面前后进退（扶壁与冲沟），崖面法线因此有起伏
+float terNoise(vec3 v, out vec3 gradW) {
+  vec2 c = tanCoord(v);
+  vec4 a = texture(uHeightTex, c * uWigS + uWigOrg);
+  const float an = 1.31;
+  mat2 R1 = mat2(cos(an), sin(an), -sin(an), cos(an));
+  float s1 = 1.0 / (LAYER_L[1] * TILE_FEAT);
+  vec4 b = texture(uHeightTex, (R1 * c) * s1 + uLayerOrg[1]);
+  vec2 g = uTerWig * a.gb * uWigS + uCliffJit * (transpose(R1) * b.gb) * s1;
+  gradW = g.x * uFrameE + g.y * uFrameN;
+  return uTerWig * (a.r - uW0) + uCliffJit * (b.r - uB0);
+}
+float terF(vec3 v) { vec3 g; return fract(uCamFy + v.y / uTerW + terNoise(v, g)); }
+vec3 terGradPhase(vec3 v) { vec3 g; terNoise(v, g); return vec3(0.0, 1.0 / uTerW, 0.0) + g; }
+float gF = 0.0; vec3 gGradW = vec3(0.0);           // altBase 顺手留下的阶地相位与噪声梯度（步进时复用，省纹理读取）
+float altBase(vec3 v) {
+  float yX = uCamPos.y + v.y;
+  float tr = trench(yX) - uTrenchP;
+  if (uGroundMode == 0) return uCamAltS - dRho(v) + tr;
+  float rsX = sqrt(max(uR * uR - yX * yX, 0.0));
+  float dRs = -(2.0 * uCamPos.y * v.y + v.y * v.y) / (rsX + uRsphP);
+  gF = fract(uCamFy + v.y / uTerW + terNoise(v, gGradW));
+  return uCamAltT + dRs - uHcS * (sawS(gF) - sawS(uCamFy)) + tr - dRxz(v);
+}
+
+// 多尺度位移（大→小），返回 x＝位移 km（向上为正），yz＝对东、北的偏导。
+// foot＝像素足迹（km）：小于足迹的层淡出＝预滤波；clear＝当前离基准面的间隙：远大于余下各层幅度就提前停。
+vec3 dispLayers(vec2 c, float foot, float clear) {
+  vec3 acc = vec3(0.0);
+  float amp = uZoneAmp * uDispScale;
+  for (int k = 0; k < 5; k++) {
+    float L = LAYER_L[k];
+    float fade = 1.0 - smoothstep(0.3 * L, 1.2 * L, foot);
+    if (fade <= 0.0) break;
+    if (clear - acc.x > 2.5 * LAYER_REST[k] * amp) break;
+    float an = float(k) * 1.31;
+    mat2 Rk = mat2(cos(an), sin(an), -sin(an), cos(an));
+    float s = 1.0 / (L * TILE_FEAT);
+    vec4 tx = texture(uHeightTex, (Rk * c) * s + uLayerOrg[k]);
+    float A = LAYER_A[k] * amp * fade;
+    acc.x += A * tx.r;
+    acc.yz += A * s * (transpose(Rk) * tx.gb);
+  }
+  return acc;
+}
+float altAt(vec3 v, float foot) {
+  float b = altBase(v);
+  return b - dispLayers(tanCoord(v), foot, b).x;
+}
+float dSaw(float x, float a, float b) { float u = sat((x - a) / (b - a)); return 6.0 * u * (1.0 - u) / (b - a); }
+
+vec3 terrainNormal(vec3 v, float foot) {
+  vec3 X = uCamPos + v;
+  vec3 g;
+  if (uGroundMode == 1) {
+    float rs = sqrt(max(uR * uR - X.y * X.y, 1.0));
+    vec3 gp = terGradPhase(v);
+    vec3 rh = vec3(X.x, 0.0, X.z) / length(X.xz);
+    g = vec3(0.0, -X.y / rs + trenchD(X.y), 0.0) - uHcS * sawSD(terF(v)) * gp - rh;
+  } else {
+    g = -normalize(X) + vec3(0.0, trenchD(X.y), 0.0);
+  }
+  vec3 dd = dispLayers(tanCoord(v), foot, 0.0);
+  g -= dd.y * uFrameE + dd.z * uFrameN;
+  return normalize(g);
+}
+
+// 近处高度场步进。阶地模式下崖面区（f∈[1−c,1]）坡度大，进入前把步长截在崖面边界，崖内小步走。
+float marchTerrain(vec3 d, float tMax, float pix) {
+  float t = 0.0, tPrev = 0.0, aPrev = altAt(vec3(0.0), 1e-4);
+  float rampSlope = abs(uHcS) / max(uCliffFrac * uTerW, 1e-4);
+  // 锥形步进：地面坡度不超过 uLip，视线仰角 θ（相对踏面或球面）越大，一步可以走得越远
+  vec3 nUp = uGroundMode == 1 ? uFrameU : -normalize(uCamPos);
+  float sinT = dot(d, nUp), cosT = sqrt(max(1.0 - sinT * sinT, 0.0));
+  float kStep = 1.0 / max(uLip * cosT - sinT, 0.3);
+  for (int i = 0; i < Q_TER_STEPS; i++) {
+    vec3 v = d * t;
+    float foot = max(t * pix, 2e-4);
+    float a = altAt(v, foot);
+    if (a < 0.0) {                                   // 越过地面：割线法细化
+      float tl = tPrev, th = t, al = aPrev, ah = a;
+      for (int j = 0; j < 5; j++) {
+        float tm = tl + (th - tl) * al / max(al - ah, 1e-9);
+        float am = altAt(d * tm, max(tm * pix, 2e-4));
+        if (am < 0.0) { th = tm; ah = am; } else { tl = tm; al = am; }
+      }
+      return tl;
+    }
+    if (a < 0.3 * foot) return t;
+    // 高过一切可能的地形且仍在上升 → 近处不会再碰地面（凹面里要过了弦的中点才往下走）
+    float aS = altSphere(v);
+    if (aS > uClearMax && dot(d, -normalize(uCamPos + v)) > 0.02) return INF;
+    float dt = a * min(kStep, 3.0);
+    if (uGroundMode == 1) {
+      float f = gF;                                  // 来自刚才的 altAt → altBase
+      float a0 = 1.0 - uCliffFrac;
+      float dfdt = dot(d, vec3(0.0, 1.0 / uTerW, 0.0) + gGradW);
+      if (f >= a0) dt = a / (1.0 + rampSlope);
+      else if (abs(dfdt) > 1e-6) {
+        float df = dfdt > 0.0 ? (a0 - f) : f;       // 到下一段崖面边界（相位非线性，打八折）
+        dt = min(dt, 0.8 * df / abs(dfdt) + 1e-4);
+      }
+    }
+    dt = max(dt, 3e-4 + foot * 0.8);                 // 最小步长＝像素足迹（远处自动放粗）
+    tPrev = t; aPrev = a;
+    t += dt;
+    if (t > tMax) return INF;
+  }
+  // 步数用尽：多半是贴地掠射，就近当作命中（比漏成天空好）
+  return altAt(d * t, max(t * pix, 2e-4)) < 0.05 * t + 0.02 ? t : -1.0;
+}
+
+float terrainShadow(vec3 v0, vec3 l) {
+  float res = 1.0, t = 0.004;
+  for (int i = 0; i < Q_SHADOW_STEPS; i++) {
+    vec3 v = v0 + l * t;
+    float a = altAt(v, 0.05 + t * 0.01);              // 阴影只看大尺度（细层淡出，省读取）
+    res = min(res, 10.0 * a / t);
+    if (res < 0.02) return 0.0;
+    t += clamp(a * 0.7, 0.004, 0.25 * uTerW + 0.5);
+    if (t > 30.0) break;
+  }
+  return sat(res);
+}
+
+// =====================================================================================
+//  5. 材质：各域地表（程序生成，无外部纹理）
+// =====================================================================================
+struct Surf { vec3 alb; float rough; float wet; };
+
+vec4 zoneWeightsAt(vec3 X) {            // x 轻 y 平 z 重 w 罪域
+  float g = uGEq * length(X.xz) / uR;
+  float wl = 1.0 - smoothstep(uGLight - 0.04, uGLight + 0.04, g);
+  float wh = smoothstep(uGHeavy - 0.04, uGHeavy + 0.04, g);
+  return vec4(wl, max(1.0 - wl - wh, 0.0), wh, ruiMask(X));
+}
+float limboWeightAt(vec3 X) { return 1.0 - smoothstep(uLimboKm * 0.8, uLimboKm, abs(X.y)); }
+
+Surf terrainSurf(vec3 v, vec3 n, float noiseA, vec4 zw, float limbo) {
+  vec3 X = uCamPos + v;
+  vec3 upG = -vec3(X.x, 0.0, X.z) / length(X.xz);
+  float flatW = sat((dot(n, upG) - 0.55) / 0.4);        // 1＝平地，0＝崖
+  float strata = fract(dRxz(v) / 0.045 + noiseA * 1.7);   // 崖面上的水平岩层（等离轴半径，噪声扭曲）
+  float band = (smoothstep(0.3, 0.5, strata) - smoothstep(0.7, 0.95, strata)) * smoothstep(0.2, 0.6, noiseA);
+  float nz = noiseA;
+  // 罪域：赤红黑岩 + 酸蚀硫酸盐结壳 + 湿
+  vec3 basalt = vec3(0.034, 0.030, 0.030), rust = vec3(0.20, 0.068, 0.036), crust = vec3(0.40, 0.36, 0.21);
+  vec3 rui = mix(mix(basalt, rust, band * 0.85), mix(rust * 0.8, basalt, smoothstep(0.4, 0.7, nz)), flatW);
+  rui = mix(rui, crust, flatW * smoothstep(0.78, 0.92, nz) * 0.8);
+  // 重域（非罪域）：暗褐岩、稀灌丛
+  vec3 heavy = mix(mix(vec3(0.085, 0.07, 0.058), vec3(0.13, 0.09, 0.06), band), vec3(0.06, 0.07, 0.035), flatW * 0.6);
+  // 平域：草、土、裸岩
+  vec3 grass = mix(vec3(0.055, 0.085, 0.03), vec3(0.11, 0.10, 0.045), smoothstep(0.3, 0.8, nz));
+  vec3 plain = mix(mix(vec3(0.19, 0.18, 0.165), vec3(0.15, 0.12, 0.08), band), grass, flatW);
+  // 轻域：白垩、灰白（余息带来的细白灰）
+  vec3 light = mix(vec3(0.42, 0.41, 0.40), vec3(0.62, 0.62, 0.64), flatW * smoothstep(0.3, 0.7, nz));
+  vec3 lim = mix(vec3(0.23, 0.23, 0.24), vec3(0.03, 0.03, 0.035), smoothstep(0.7, 0.8, nz));
+  vec3 alb = light * zw.x + plain * zw.y + heavy * zw.z;
+  alb = mix(alb, rui, zw.w);
+  alb = mix(alb, lim, limbo);
+  float wet = uWet * zw.w;
+  float puddle = wet * flatW * smoothstep(0.15, 0.05, nz);
+  alb *= mix(1.0, 0.55, wet * 0.8);
+  Surf s;
+  s.alb = alb;
+  s.rough = mix(0.9, 0.35, wet * 0.7);
+  s.rough = mix(s.rough, 0.06, puddle);
+  s.wet = max(wet * 0.5, puddle);
+  return s;
+}
+
+// 宏观（远处）反照率：随域与大陆尺度噪声
+vec3 macroAlbedo(vec3 X, vec4 zw, float limbo) {
+  vec4 nz = texture(uNoise3D, X / 2600.0);
+  float v = nz.r;
+  vec3 light = vec3(0.40, 0.40, 0.39) + 0.1 * v;
+  vec3 plain = mix(vec3(0.07, 0.09, 0.045), vec3(0.16, 0.13, 0.085), smoothstep(0.35, 0.7, v));
+  vec3 heavy = mix(vec3(0.09, 0.07, 0.055), vec3(0.12, 0.08, 0.055), v);
+  vec3 rui = mix(vec3(0.06, 0.035, 0.03), vec3(0.11, 0.05, 0.035), v);
+  vec3 a = light * zw.x + plain * zw.y + heavy * zw.z;
+  a = mix(a, rui, zw.w);
+  return mix(a, vec3(0.2, 0.2, 0.21), limbo);
+}
+
+// =====================================================================================
+//  6. 云：近处体积步进（快照合成）＋ 远处（对面世界）二维近似
+// =====================================================================================
+float cloudCoverage(vec3 X) {
+  vec3 n = X / length(X);
+  // 自转一周约 71 分钟 → 科氏力强，云街沿方位（东西）拉长；纬向急流相间：按纬度差速旋转采样
+  float th = uWind.z * sin(n.y * 9.0);
+  vec3 q = vec3(n.x * cos(th) - n.z * sin(th), n.y * 2.6, n.x * sin(th) + n.z * cos(th));
+  vec4 a = texture(uNoise3D, q * 0.55 + 0.37);
+  vec4 b = texture(uNoise3D, q * 1.9 + 0.11);
+  float base = a.r * 0.7 + b.r * 0.3;
+  float cov = smoothstep(1.0 - uCloudCover - 0.18, 1.0 - uCloudCover + 0.2, base);
+  float hole = smoothstep(0.62, 0.8, b.g);                    // 罪域阴云里偶尔的云缝
+  return max(cov, ruiMask(X) * uRuiOvercast * (1.0 - 0.6 * hole));
+}
+float cloudDens(vec3 X, float hn, float cov, int lod) {
+  if (hn <= 0.0 || hn >= 1.0 || cov <= 0.01) return 0.0;
+  float prof = smoothstep(0.0, 0.1, hn) * (1.0 - smoothstep(0.35 + 0.6 * cov, 1.0, hn));
+  vec4 s = texture(uNoise3D, X / 24.0 + uWind * 0.02);
+  float wfbm = s.g * 0.625 + s.b * 0.25 + s.a * 0.125;
+  float shape = sat((s.r - (1.0 - wfbm) * 0.45) / 0.55 + 0.1);
+  float dens = sat((shape * prof - (1.0 - cov)) / max(cov, 0.05));
+  if (lod == 0 && dens > 0.0) {
+    vec4 dn = texture(uNoise3D, X / 3.2 + uWind * 0.08);
+    float det = dn.g * 0.625 + dn.b * 0.25 + dn.a * 0.125;
+    dens = sat(dens - (1.0 - det) * 0.32 * (1.0 - dens));
+  }
+  return dens;
+}
+float cloudHn(vec3 X) { return (uR - length(X) - uCloudBase) / (uCloudTop - uCloudBase); }
+
+// 体积云：返回 rgb＝云自身的散射光（不含云前大气），a＝透射率；tMean＝透射率加权深度
+vec4 marchClouds(vec3 o, vec3 d, float t0, float t1, float jit, out float tMean) {
+  tMean = INF;
+  float len = min(t1 - t0, 160.0);
+  if (len <= 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
+  float dt = len / float(Q_CLOUD_STEPS);
+  float T = 1.0, wsum = 0.0, tw = 0.0;
+  vec3 L = vec3(0.0);
+  vec3 skyUp = vec3(0.0), skyDn = vec3(0.0);
+  vec3 Xm = o + d * (t0 + 0.5 * len);
+  vec3 upM = -Xm / length(Xm);
+  skyUp = skyIrradiance(upM) / PI;     // 云顶方向的天光辐亮度
+  skyDn = skyIrradiance(-upM) / PI;    // 地面方向的反照
+  for (int i = 0; i < Q_CLOUD_STEPS; i++) {
+    float t = t0 + (float(i) + jit) * dt;
+    vec3 X = o + d * t;
+    float hn = cloudHn(X);
+    float cov = cloudCoverage(X);
+    float dens = cloudDens(X, hn, cov, t < 40.0 ? 0 : 1);
+    if (dens > 0.003) {
+      float sig = dens * uCloudSigma;
+      vec3 Ls = uSunPos - X;
+      float ds2 = dot(Ls, Ls);
+      vec3 l = Ls * inversesqrt(ds2);
+      vec3 up = -X / length(X);
+      float vis = bodyVisTower(X, uSunPos, uSunRad);
+      float tauL = 0.0;
+      if (vis > 0.0) {                                   // 朝太阳的自遮挡：步长倍增
+        float s = 0.25;
+        for (int j = 0; j < Q_CLOUD_LIGHT; j++) {
+          vec3 Y = X + l * s;
+          tauL += cloudDens(Y, cloudHn(Y), cov, 1) * uCloudSigma * s * 0.75;
+          s *= 2.2;
+        }
+      }
+      float mu = max(dot(l, up), 0.05);
+      vec3 Esun = uSunI / ds2 * vis * transToward(uR - length(X), mu) * veilT(X, uSunPos);
+      float c = dot(d, l);
+      // 多次散射八度近似（Wrenninge）：光学厚度、散射率、各向异性逐级减半
+      float ms = 0.0, aa = 1.0, bb = 1.0, cc = 1.0;
+      for (int o2 = 0; o2 < 3; o2++) {
+        ms += aa * exp(-tauL * bb) * mix(phaseHG(c, 0.8 * cc), phaseHG(c, -0.25 * cc), 0.25);
+        aa *= 0.55; bb *= 0.45; cc *= 0.5;
+      }
+      // 厚云深处的漫射场（双流近似）：τ' 为上方光学厚度，云底亮度 → (1−R)·Eμ/π
+      float tauUp = tauL * mu;
+      float tauBelow = sig * max(uR - length(X) - uCloudBase, 0.0) * 0.6;
+      float tauTot = tauUp + tauBelow;
+      float diff = (2.0 + 0.15 * tauBelow) / (2.0 + 0.15 * tauTot) * (1.0 - exp(-tauUp));
+      vec3 S = Esun * (ms + diff * mu / PI) + mix(skyDn, skyUp, sat(hn)) * 0.5;
+      if (uMoonE.g > 1e-7) S += uMoonE * 0.6 * mix(phaseHG(dot(d, normalize(uMoonPos - X)), 0.7), 0.08, 0.5);
+      float Tst = exp(-sig * dt);
+      L += T * S * (1.0 - Tst);
+      tw += T * (1.0 - Tst) * t; wsum += T * (1.0 - Tst);
+      T *= Tst;
+      if (T < 0.01) break;
+    }
+  }
+  if (wsum > 0.0) tMean = tw / wsum;
+  return vec4(L, T);
+}
+
+// 对面世界的云：像素足迹有几公里，单样本 + 双流反照率
+vec4 farCloud(vec3 X, float pathLen) {
+  float cov = cloudCoverage(X);
+  float dens = cloudDens(X, 0.45, cov, 2);
+  float tau = dens * uCloudSigma * pathLen * 0.5;
+  if (tau < 0.01) return vec4(0.0, 0.0, 0.0, 1.0);
+  float R = 0.15 * tau / (2.0 + 0.15 * tau);
+  vec3 up = -X / length(X);
+  vec3 Ls = uSunPos - X;
+  float ds2 = dot(Ls, Ls);
+  vec3 l = Ls * inversesqrt(ds2);
+  float vis = bodyVisTower(X, uSunPos, uSunRad);
+  float mu = max(dot(l, up), 0.0);
+  vec3 E = uSunI / ds2 * vis * transToward(uR - length(X), mu) * mu * veilT(X, uSunPos);
+  vec3 Lc = (R / PI) * E * (1.0 + uAmbK);
+  float Tc = 1.0 - R;
+  return vec4(Lc, Tc * Tc);
+}
+
+// =====================================================================================
+//  7. 着色
+// =====================================================================================
+// 远处内壁（宏观）：阶地按“踏面 + 崖面”两朵微面的投影面积加权，崖遮踏面按解析比例
+vec3 shadeWall(vec3 X, vec3 d) {
+  float rX = length(X.xz);
+  vec3 nS = -X / length(X);
+  vec3 upG = -vec3(X.x, 0.0, X.z) / max(rX, 1e-3);
+  vec4 zw = zoneWeightsAt(X);
+  float limbo = limboWeightAt(X);
+  vec3 alb = macroAlbedo(X, zw, limbo);
+  float abyss = 1.0 - smoothstep(uAbyssHalf * 0.6, uAbyssHalf, abs(X.y));
+  vec3 Ls = uSunPos - X;
+  float ds2 = dot(Ls, Ls);
+  vec3 l = Ls * inversesqrt(ds2);
+  float vis = bodyVisTower(X, uSunPos, uSunRad);
+  float h = uR - length(X);
+  float muS = max(dot(l, nS), 0.0);
+  vec3 E = uSunI / ds2 * transToward(h, muS) * veilT(X, uSunPos);
+  float cosI = muS;
+  if (uGroundMode == 1 && abs(X.y) > 1.0) {
+    vec3 nR = vec3(0.0, -sign(X.y), 0.0);           // 崖面朝向：背离近极（朝赤道）
+    float W = uTerW, H = abs(uHcS);
+    float wt = W * max(dot(-d, upG), 0.0), wr = H * max(dot(-d, nR), 0.0);
+    float tread = max(dot(upG, l), 0.0), riser = max(dot(nR, l), 0.0);
+    float shadowFrac = sat(H * sqrt(max(1.0 - tread * tread, 0.0)) / max(tread, 1e-3) / W * max(dot(l, -nR), 0.0));
+    cosI = (wt * tread * (1.0 - shadowFrac) + wr * riser) / max(wt + wr, 1e-6);
+  }
+  vec3 col = alb / PI * E * (vis * cosI + uAmbK * mix(0.25, 1.0, vis) * muS);
+  col *= 1.0 - 0.97 * abyss * (uAbyssDepth > 0.0 ? 1.0 : 0.0);
+  return col;
+}
+
+vec3 shadeTower(vec3 X, vec3 d) {
+  if (uTowerAlb <= 0.0) return vec3(0.0);
+  vec3 n = normalize(vec3(X.x, 0.0, X.z));
+  vec3 Ls = uSunPos - X;
+  vec3 l = normalize(Ls);
+  float vis = bodyVisTower(X + n * 0.5, uSunPos, uSunRad);
+  return uTowerAlb / PI * (uSunI / dot(Ls, Ls) * vis * max(dot(n, l), 0.0) + skyIrradiance(n));
+}
+
+vec3 shadeSunDisk(vec3 o, vec3 d, float t) {
+  vec3 n = normalize(o + d * t - uSunPos);
+  float mu = max(dot(n, -d), 0.0);
+  float limb = (1.0 - 0.6 * (1.0 - mu)) / 0.8;       // 一次临边昏暗，平均亮度守恒
+  return uSunI / (PI * uSunRad * uSunRad) * limb;
+}
+
+vec3 shadeMoonDisk(vec3 o, vec3 d, float t) {
+  vec3 Q = o + d * t;
+  vec3 n = normalize(Q - uMoonPos);
+  vec3 nb = transpose(uMoonBasis) * n;
+  vec4 nz = texture(uNoise3D, nb * 0.33 + 0.5);
+  vec4 nz2 = texture(uNoise3D, nb * 1.4 + 0.2);
+  float maria = smoothstep(0.42, 0.6, nz.r);
+  float craters = smoothstep(0.75, 0.95, nz2.g) - 0.6 * smoothstep(0.92, 1.0, nz2.g);
+  float A = uMoonAlb * mix(1.2, 0.62, maria) * (0.92 + 0.25 * craters);
+  vec3 Ls = uSunPos - Q;
+  float ds2 = dot(Ls, Ls);
+  vec3 l = Ls * inversesqrt(ds2);
+  float vis = bodyVisTower(Q, uSunPos, uSunRad);    // 塔影落在月面：黑月与半影的过渡
+  float mu0 = max(dot(n, l), 0.0), mu = max(dot(n, -d), 0.0);
+  vec3 L = A / PI * uSunI / ds2 * vis * exp(-uVeilK * sqrt(ds2)) * (2.0 * mu0 / (mu0 + mu + 1e-4));   // Lommel–Seeliger：月面平光
+  vec3 Ew = max(uMoonW0 + uMoonW1 * n, vec3(0.0)); // 壁照：内壁白昼反照到月面
+  return L + A / PI * Ew;
+}
+
+vec3 shadeTerrain(vec3 v, vec3 d, float t, float pix) {
+  vec3 X = uCamPos + v;
+  float foot = max(t * pix, 2e-4);
+  vec3 n = terrainNormal(v, foot);
+  float hAtm = uR - length(X);
+  vec2 c = tanCoord(v);
+  float noiseA = texture(uHeightTex, c / (0.9 * TILE_FEAT) + uLayerOrg[1]).a;
+  Surf s = terrainSurf(v, n, noiseA, uZoneW, uLimboW);
+  vec3 upG = -vec3(X.x, 0.0, X.z) / length(X.xz);
+  // 太阳
+  vec3 Ls = uSunPos - X;
+  float ds2 = dot(Ls, Ls);
+  vec3 l = Ls * inversesqrt(ds2);
+  float vis = bodyVisTower(X, uSunPos, uSunRad) * occultVis(X, uSunPos, uSunRad, uMoonPos, uMoonRad);
+  float nl = dot(n, l);
+  vec3 col = vec3(0.0);
+  if (vis > 0.0 && nl > 0.0) {
+    float sh = terrainShadow(v + n * 0.0015, l);
+    float cT = 1.0;
+    if (uCloudOn > 0.5 && sh > 0.0) {               // 云影：沿日光穿过云层的三个样本
+      vec2 sb = iSphere(X, l, uR - uCloudBase);
+      float tb = sb.y > 0.0 ? max(sb.x, 0.0) : 0.0;
+      float tau = 0.0;
+      for (int j = 0; j < 3; j++) {
+        vec3 Y = X + l * (tb + (float(j) + 0.5) / 3.0 * (uCloudTop - uCloudBase) / max(dot(l, -normalize(X)), 0.2));
+        tau += cloudDens(Y, cloudHn(Y), cloudCoverage(Y), 1);
+      }
+      cT = exp(-tau / 3.0 * uCloudSigma * (uCloudTop - uCloudBase) / max(dot(l, -normalize(X)), 0.2));
+    }
+    vec3 E = uSunI / ds2 * vis * sh * cT * transToward(hAtm, dot(l, -normalize(X))) * veilT(X, uSunPos);
+    // 漫反射 + 湿面的 GGX 高光
+    vec3 hv = normalize(l - d);
+    float a2 = s.rough * s.rough * s.rough * s.rough;
+    float nh = max(dot(n, hv), 0.0);
+    float D = a2 / (PI * pow(nh * nh * (a2 - 1.0) + 1.0, 2.0));
+    float F = 0.02 + 0.98 * pow(1.0 - max(dot(hv, -d), 0.0), 5.0);
+    float spec = D * F * 0.25 / max(nl * max(dot(n, -d), 0.05), 1e-3) * nl;
+    col += E * (s.alb / PI * nl + s.wet * spec);
+  }
+  // 月
+  if (uMoonE.g > 1e-7) {
+    vec3 lm = normalize(uMoonPos - X);
+    float vm = bodyVisTower(X, uMoonPos, uMoonRad);
+    col += s.alb / PI * uMoonE * vm * veilT(X, uMoonPos) * max(dot(n, lm), 0.0) * transToward(hAtm, dot(lm, -normalize(X)));
+  }
+  // 天光（含夜里对面世界的辉光）× 崖脚遮蔽
+  float ao = 1.0;
+  if (uGroundMode == 1) {
+    float f = terF(v);
+    float dist = (uHcS > 0.0 ? f : (1.0 - uCliffFrac - f)) / length(terGradPhase(v));
+    float beta = atan(abs(uHcS), max(dist, 1e-4));
+    ao = 1.0 - (1.0 - cos(beta)) * 0.5 * sat((dot(n, upG) - 0.8) / 0.2);
+  }
+  col += s.alb / PI * skyIrradiance(n) * ao;
+  return col;
+}
+</script>
+<script id="glsl-main" type="x-shader">// =====================================================================================
+//  主 pass：每像素一条视线。解析求交（内壁/塔/日/月）→ 近处高度场步进 → 云 → 大气（快照合成）
+//  输出：rgb＝预曝光后的辐亮度（RGBA16F），a＝命中距离 km（供 TAA 重投影）
+//  依赖 common.glsl（拼接在前）
+// =====================================================================================
+layout(location = 0) out vec4 fragColor;
+uniform int uDebug;
+
+void main() {
+  vec2 fc = gl_FragCoord.xy;
+  float jit = ign(fc, uFrame);
+  vec2 ndc = (2.0 * (fc + uJitter) - uRes) / uRes.y;
+  vec3 d = normalize(uCamFwd + uTanHalfFov * (ndc.x * uCamRight + ndc.y * uCamUp));
+  vec3 o = uCamPos;
+  float pix = 2.0 * uTanHalfFov / uRes.y;           // 每像素弧度
+  float expo = texelFetch(uExpTex, ivec2(0), 0).x;
+  vec3 skyMean = skyMeanRadiance();
+
+  // —— 1. 解析求交 ——
+  vec2 wall = iSphereBC(dot(o, d), uCamC0);          // c 由 CPU 双精度给出，近地不丢精度
+  float tWall = wall.y > 0.0 ? wall.y : INF;
+  float tTower = iTower(o, d);
+  vec2 sI = iSphere(o - uSunPos, d, uSunRad);
+  float tSun = (sI.x < sI.y && sI.x > 0.0) ? sI.x : INF;
+  vec2 mI = iSphere(o - uMoonPos, d, uMoonRad);
+  float tMoon = (mI.x < mI.y && mI.x > 0.0) ? mI.x : INF;
+
+  // —— 2. 近处地形（高度场）——
+  float tLim = min(Q_NEAR_KM, tTower);
+  if (wall.y > 0.0) {                                // 朝下的视线：地面可能低于宏观球面，多走一点
+    vec2 w2 = iSphere(o, d, uR + uClearMax + abs(uHcS) + uAbyssDepth);
+    tLim = min(tLim, max(w2.y, 0.0) + 0.5);
+  }
+  float tTer = marchTerrain(d, tLim, pix);
+  bool exhausted = tTer < 0.0;
+  if (exhausted) tTer = INF;
+
+  // —— 3. 第一个命中 ——
+  int kind = 0;                 // 0 远处内壁，1 近处地形，2 塔，3 太阳，4 月
+  float tHit = tWall;
+  if (tTer < tHit)   { tHit = tTer;   kind = 1; }
+  if (tTower < tHit) { tHit = tTower; kind = 2; }
+  if (tMoon < tHit)  { tHit = tMoon;  kind = 4; }
+  if (tSun < tHit)   { tHit = tSun;   kind = 3; }
+  if (tHit >= INF * 0.5) { fragColor = vec4(0.0, 0.0, 0.0, 6e4); return; }
+  if (uDebug == 1) {                                  // 调试：按命中类别着色
+    vec3 kc = kind == 0 ? vec3(0.2, 0.4, 1.0) : kind == 1 ? vec3(0.2, 0.9, 0.2) : kind == 2 ? vec3(0.0) : kind == 3 ? vec3(1.0, 0.9, 0.2) : vec3(0.8);
+    if (exhausted) kc = vec3(1.0, 0.0, 0.0);
+    fragColor = vec4(kc * 1000.0 * expo, tHit); return;
+  }
+
+  // —— 4. 表面辐亮度 ——
+  vec3 Ls;
+  vec3 X = o + d * tHit;
+  if (kind == 1)      Ls = shadeTerrain(d * tHit, d, tHit, pix);
+  else if (kind == 2) Ls = shadeTower(X, d);
+  else if (kind == 3) Ls = shadeSunDisk(o, d, tHit);
+  else if (kind == 4) Ls = shadeMoonDisk(o, d, tHit);
+  else                Ls = shadeWall(X, d);
+
+  // —— 5. 云：近处体积，远处（对面世界）二维 ——
+  vec4 nearC = vec4(0.0, 0.0, 0.0, 1.0);
+  float tc = INF;
+  if (uCloudOn > 0.5) {
+    vec2 sb = iSphere(o, d, uR - uCloudBase);
+    vec2 st = iSphere(o, d, uR - uCloudTop);
+    bool stHit = st.x < st.y;
+    if (sb.x < sb.y) {
+      float a0 = max(sb.x, 0.0), a1 = stHit ? st.x : sb.y;
+      float b0 = stHit ? st.y : INF, b1 = sb.y;
+      a1 = min(a1, tHit);
+      if (a1 > a0 && a0 < 400.0) nearC = marchClouds(o, d, a0, a1, jit, tc);
+      // 第二段：要么是对面世界的云（远），要么是相机在云顶之上往下看（近）
+      if (stHit && kind == 0 && b1 <= tHit + 1.0 && b1 > b0) {
+        if (b0 > 400.0) {
+          vec4 fc2 = farCloud(o + d * (0.5 * (b0 + b1)), min(b1 - b0, 60.0));
+          Ls = Ls * fc2.a + fc2.rgb;
+        } else if (nearC.a > 0.99) nearC = marchClouds(o, d, max(b0, 0.0), min(b1, tHit), jit, tc);
+      }
+    }
+  }
+
+  // —— 6. 大气：两端加密积分；在云深度处取快照，按 L = A[0,tc] + T[0,tc]·C + Tc·(A[tc,end] + T·Ls) 合成 ——
+  gSnapT = tc;
+  vec3 Lin, Tr;
+  integrateAtmo(o, d, tHit, jit, skyMean, Q_ATM_NEAR, Q_ATM_FAR, Lin, Tr);
+  vec3 col;
+  if (tc < INF * 0.5) col = gSnapL + gSnapT3 * nearC.rgb + nearC.a * (Lin - gSnapL + Tr * Ls);
+  else                col = Lin + Tr * Ls;
+
+  fragColor = vec4(min(col * expo, vec3(6.0e4)), min(tHit, 6.0e4));
+}
+</script>
+<script id="glsl-probe" type="x-shader">// =====================================================================================
+//  天空探针：32×16 经纬图（世界系方向），给 SH9 投影用。复用主 pass 的函数，但：
+//  不走近处高度场（脚下用宏观内壁代替）、不画日面、样本减半。输出未曝光的辐亮度（cd/m²）。
+// =====================================================================================
+layout(location = 0) out vec4 fragColor;
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / vec2(32.0, 16.0);
+  float th = uv.y * PI, ph = uv.x * 2.0 * PI;
+  vec3 d = vec3(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));
+  vec3 o = uCamPos;
+  float jit = fract(ign(gl_FragCoord.xy, uFrame) + 0.5);
+  vec3 skyMean = skyMeanRadiance();
+  vec2 wall = iSphereBC(dot(o, d), min(uCamC0, -1e-3));
+  float tWall = wall.y > 0.0 ? wall.y : 1e-3;
+  float tTower = iTower(o, d);
+  vec2 mI = iSphere(o - uMoonPos, d, uMoonRad);
+  float tMoon = (mI.x < mI.y && mI.x > 0.0) ? mI.x : INF;
+  float tHit = tWall; int kind = 0;
+  if (tTower < tHit) { tHit = tTower; kind = 2; }
+  if (tMoon < tHit)  { tHit = tMoon;  kind = 4; }
+  vec3 X = o + d * tHit;
+  vec3 Ls = kind == 2 ? shadeTower(X, d) : kind == 4 ? shadeMoonDisk(o, d, tHit) : shadeWall(X, d);
+  vec4 nearC = vec4(0.0, 0.0, 0.0, 1.0);
+  float tc = INF;
+  if (uCloudOn > 0.5) {
+    vec2 sb = iSphere(o, d, uR - uCloudBase);
+    vec2 st = iSphere(o, d, uR - uCloudTop);
+    bool stHit = st.x < st.y;
+    if (sb.x < sb.y) {
+      float a0 = max(sb.x, 0.0), a1 = min(stHit ? st.x : sb.y, tHit);
+      if (a1 > a0 && a0 < 400.0) nearC = marchClouds(o, d, a0, a1, jit, tc);
+      if (stHit && kind == 0 && st.y > 400.0 && sb.y <= tHit + 1.0) {
+        vec4 fc2 = farCloud(o + d * (0.5 * (st.y + sb.y)), min(sb.y - st.y, 60.0));
+        Ls = Ls * fc2.a + fc2.rgb;
+      }
+    }
+  }
+  gSnapT = tc;
+  vec3 Lin, Tr;
+  integrateAtmo(o, d, tHit, jit, skyMean, max(Q_ATM_NEAR / 2, 4), max(Q_ATM_FAR / 2, 4), Lin, Tr);
+  vec3 col = tc < INF * 0.5 ? gSnapL + gSnapT3 * nearC.rgb + nearC.a * (Lin - gSnapL + Tr * Ls) : Lin + Tr * Ls;
+  fragColor = vec4(min(col, vec3(6.0e4)), 1.0);
+}
+</script>
+<script id="glsl-mslut" type="x-shader">// =====================================================================================
+//  多重散射 LUT（Hillaire 2020 的凹面版）：32×32，x＝sqrt(h/hcut)，y＝μs（日对“球心方向”的余弦）
+//  从离壁 h 的点向 64 个方向积分二阶散射；朝里的射线进入真空核即止，朝外/平的射线落到内壁（地面反照 0.15）。
+//  Ψms = L2 / (1 − f_ms)；主 pass 里多次散射源＝σs · Ψms · E太阳 · 塔影可见度。
+//  只在 H、能见度改变时重算一次。依赖 common.glsl 的大气部分。
+// =====================================================================================
+layout(location = 0) out vec4 fragColor;
+
+void main() {
+  vec2 uv = (gl_FragCoord.xy - 0.5) / 31.0;
+  float h = uv.x * uv.x * uHcut;
+  float muS = uv.y;
+  vec3 X0 = vec3(0.0, uR - h, 0.0);                  // 局部：−y 是“朝球心”（天顶）
+  vec3 zen = vec3(0.0, -1.0, 0.0);
+  vec3 l = vec3(sqrt(max(1.0 - muS * muS, 0.0)), -muS, 0.0);
+  const int ND = 64, NS = 20;
+  vec3 L2 = vec3(0.0), fms = vec3(0.0);
+  for (int i = 0; i < ND; i++) {
+    float z = 1.0 - 2.0 * (float(i) + 0.5) / float(ND);           // Fibonacci 球面
+    float ph = float(i) * 2.39996323;
+    vec3 w = vec3(sqrt(max(1.0 - z * z, 0.0)) * cos(ph), z, sqrt(max(1.0 - z * z, 0.0)) * sin(ph));
+    vec2 wl = iSphere(X0, w, uR);
+    float tW = wl.y;                                               // 必与内壁相交
+    vec2 cr = iSphere(X0, w, uR - uHcut);
+    float tEnd = tW;
+    bool ground = true;
+    if (cr.x < cr.y && cr.x > 0.0 && cr.x < tW) { tEnd = cr.x; ground = false; }
+    tEnd = min(tEnd, 3000.0);
+    vec3 Lw = vec3(0.0), fw = vec3(0.0), T = vec3(1.0);
+    float dt = tEnd / float(NS);
+    for (int j = 0; j < NS; j++) {
+      vec3 Y = X0 + w * ((float(j) + 0.5) * dt);
+      float hy = uR - length(Y);
+      vec3 rho = densities(vec3(1e9), hy);
+      vec3 sS = uBetaR * rho.x + uBetaM * rho.y;
+      vec3 sE = uBetaR * rho.x + (uBetaM + uBetaMA) * rho.y;
+      vec3 Tst = exp(-sE * dt);
+      vec3 up = -Y / length(Y);
+      vec3 Tsun = transToward(hy, dot(l, up));
+      vec3 S = sS * Tsun * (1.0 / (4.0 * PI));
+      Lw += T * (S - S * Tst) / max(sE, vec3(1e-9));
+      fw += T * (sS - sS * Tst) / max(sE, vec3(1e-9));
+      T *= Tst;
+    }
+    if (ground) {
+      vec3 Yg = X0 + w * tEnd;
+      vec3 ng = -Yg / length(Yg);
+      Lw += T * transToward(0.0, dot(l, ng)) * max(dot(l, ng), 0.0) * 0.15 / PI;
+    }
+    L2 += Lw / float(ND);
+    fms += fw / float(ND);
+  }
+  vec3 psi = L2 / max(1.0 - fms, vec3(1e-3));
+  fragColor = vec4(psi, 1.0);
+}
+</script>
+<script id="glsl-post" type="x-shader">// =====================================================================================
+//  后处理三件：SH9 投影（sh）、自动曝光（expo）、色调映射（final）。各自以 #define PASS_* 编译。
+// =====================================================================================
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+#define PI 3.14159265359
+layout(location = 0) out vec4 fragColor;
+
+#ifdef PASS_SH
+// 9×1：每个像素是一个 SH 系数，遍历 32×16 探针（世界系方向，立体角加权）
+uniform sampler2D uProbe;
+float Y9(int i, vec3 n) {
+  if (i == 0) return 0.282095;
+  if (i == 1) return 0.488603 * n.y;
+  if (i == 2) return 0.488603 * n.z;
+  if (i == 3) return 0.488603 * n.x;
+  if (i == 4) return 1.092548 * n.x * n.y;
+  if (i == 5) return 1.092548 * n.y * n.z;
+  if (i == 6) return 0.315392 * (3.0 * n.z * n.z - 1.0);
+  if (i == 7) return 1.092548 * n.x * n.z;
+  return 0.546274 * (n.x * n.x - n.y * n.y);
+}
+void main() {
+  int k = int(gl_FragCoord.x);
+  vec3 acc = vec3(0.0);
+  for (int j = 0; j < 16; j++) for (int i = 0; i < 32; i++) {
+    float th = (float(j) + 0.5) / 16.0 * PI, ph = (float(i) + 0.5) / 32.0 * 2.0 * PI;
+    vec3 d = vec3(sin(th) * cos(ph), cos(th), sin(th) * sin(ph));
+    float dOm = (2.0 * PI / 32.0) * (PI / 16.0) * sin(th);
+    acc += texelFetch(uProbe, ivec2(i, j), 0).rgb * Y9(k, d) * dOm;
+  }
+  fragColor = vec4(acc, 1.0);
+}
+#endif
+
+#ifdef PASS_EXPO
+// 1×1：中心加权测光（人眼注视点）→ 对数平均亮度 → 目标曝光；亮→暗慢、暗→亮快；适应下限让夜晚仍然是夜晚
+uniform sampler2D uHDR;       // 预曝光的 HDR
+uniform sampler2D uPrev;      // 上一帧 (曝光, 适应亮度)
+uniform float uDt, uEV, uAdaptMin, uAdaptMax, uLock, uLockEV;
+void main() {
+  vec2 prev = texelFetch(uPrev, ivec2(0), 0).xy;
+  float expoPrev = max(prev.x, 1e-9);
+  float sw = 0.0, sl = 0.0;
+  for (int j = 0; j < 16; j++) for (int i = 0; i < 16; i++) {
+    vec2 uv = (vec2(i, j) + 0.5) / 16.0;
+    vec3 c = textureLod(uHDR, uv, 0.0).rgb / expoPrev;
+    float w = exp(-6.0 * dot(uv - 0.5, uv - 0.5));
+    sl += w * log(max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-5));
+    sw += w;
+  }
+  float La = clamp(exp(sl / sw), uAdaptMin, uAdaptMax);
+  float Lprev = prev.y > 0.0 ? prev.y : La;
+  float tau = La > Lprev ? 0.6 : 3.0;                       // 秒
+  float Lnew = exp(mix(log(Lprev), log(La), 1.0 - exp(-uDt / tau)));
+  // 人眼式 key：适应亮度 ≥100 cd/m² 时按中灰 0.18；更暗时 key 随之下降（暗处仍然显得暗，不被拉成白天）
+  float key = 0.18 * pow(clamp(Lnew / 100.0, 1e-5, 1.0), 0.2);
+  float expo = key / Lnew * exp2(uEV);
+  if (uLock > 0.5) expo = exp2(-uLockEV) / 1.2;              // 固定 EV：看绝对明暗
+  fragColor = vec4(expo, Lnew, 0.0, 1.0);
+}
+#endif
+
+#ifdef PASS_TAA
+// 时域累积（渲染分辨率）：按本帧命中距离把像素重投影到上一帧，邻域方差裁剪防拖影；
+// 相机静止且时间不走时 uBlend = 1/n 逐帧收敛（“拍照模式”）
+uniform sampler2D uCur, uHist;
+uniform vec3 uPrevPos;          // 上一帧相机位置 − 本帧相机位置（km，CPU 双精度相减）
+uniform mat3 uPrevBasisT;       // 上一帧相机基的转置：世界 → (右, 上, 前)
+uniform vec3 uCamRight, uCamUp, uCamFwd;
+uniform float uTanHalfFov, uExpoRatio, uBlend;
+uniform vec2 uRes, uJitter;
+vec3 toY(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
+vec3 fromY(vec3 y) { return vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z); }
+void main() {
+  ivec2 ip = ivec2(gl_FragCoord.xy);
+  vec4 c = texelFetch(uCur, ip, 0);
+  vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+    vec3 s = toY(texelFetch(uCur, clamp(ip + ivec2(i, j), ivec2(0), ivec2(uRes) - 1), 0).rgb);
+    m1 += s; m2 += s * s;
+  }
+  m1 /= 9.0; m2 /= 9.0;
+  vec3 sig = sqrt(max(m2 - m1 * m1, 0.0));
+  vec2 ndc = (2.0 * (gl_FragCoord.xy + uJitter) - uRes) / uRes.y;
+  vec3 d = normalize(uCamFwd + uTanHalfFov * (ndc.x * uCamRight + ndc.y * uCamUp));
+  vec3 q = uPrevBasisT * (d * c.a - uPrevPos);
+  vec2 pn = q.xy / max(q.z * uTanHalfFov, 1e-6);
+  vec2 uvp = (pn * uRes.y + uRes) * 0.5 / uRes;
+  bool ok = q.z > 0.0 && all(greaterThan(uvp, vec2(0.0))) && all(lessThan(uvp, vec2(1.0)));
+  vec3 h = clamp(toY(texture(uHist, uvp).rgb * uExpoRatio), m1 - 1.25 * sig, m1 + 1.25 * sig);
+  vec3 y = ok ? mix(h, toY(c.rgb), uBlend) : toY(c.rgb);
+  fragColor = vec4(max(fromY(y), 0.0), c.a);
+}
+#endif
+
+#ifdef PASS_BLOOM_DOWN
+// 眩光金字塔下采样（Jimenez 13 点），第一级做亮度软阈并按 Karis 平均抑制萤火
+uniform sampler2D uSrc;
+uniform vec2 uSrcTexel;          // 源纹理的 1/尺寸
+uniform float uFirst;
+vec3 kw(vec3 c) { return uFirst > 0.5 ? c / (1.0 + max(c.r, max(c.g, c.b))) : c; }
+void main() {
+  vec2 uv = gl_FragCoord.xy * 2.0 * uSrcTexel;
+  vec2 t = uSrcTexel;
+  vec3 a = texture(uSrc, uv + t * vec2(-2, -2)).rgb, b = texture(uSrc, uv + t * vec2(0, -2)).rgb, c = texture(uSrc, uv + t * vec2(2, -2)).rgb;
+  vec3 d = texture(uSrc, uv + t * vec2(-2, 0)).rgb, e = texture(uSrc, uv).rgb, f = texture(uSrc, uv + t * vec2(2, 0)).rgb;
+  vec3 g = texture(uSrc, uv + t * vec2(-2, 2)).rgb, h = texture(uSrc, uv + t * vec2(0, 2)).rgb, i = texture(uSrc, uv + t * vec2(2, 2)).rgb;
+  vec3 j = texture(uSrc, uv + t * vec2(-1, -1)).rgb, k = texture(uSrc, uv + t * vec2(1, -1)).rgb;
+  vec3 l = texture(uSrc, uv + t * vec2(-1, 1)).rgb, m = texture(uSrc, uv + t * vec2(1, 1)).rgb;
+  vec3 o = kw((j + k + l + m) * 0.25) * 0.5 + kw((a + b + d + e) * 0.25) * 0.125 + kw((b + c + e + f) * 0.25) * 0.125
+         + kw((d + e + g + h) * 0.25) * 0.125 + kw((e + f + h + i) * 0.25) * 0.125;
+  fragColor = vec4(o, 1.0);
+}
+#endif
+
+#ifdef PASS_BLOOM_UP
+// 上采样 3×3 帐篷并与本级相加；越大的级权重按 1/θ² 式衰减（人眼散射的点扩散函数）
+uniform sampler2D uSrc, uBase;
+uniform vec2 uSrcTexel;
+uniform float uW;
+void main() {
+  vec2 uv = gl_FragCoord.xy / vec2(textureSize(uBase, 0));
+  vec2 t = uSrcTexel;
+  vec3 s = texture(uSrc, uv + t * vec2(-1, -1)).rgb + 2.0 * texture(uSrc, uv + t * vec2(0, -1)).rgb + texture(uSrc, uv + t * vec2(1, -1)).rgb
+         + 2.0 * texture(uSrc, uv + t * vec2(-1, 0)).rgb + 4.0 * texture(uSrc, uv).rgb + 2.0 * texture(uSrc, uv + t * vec2(1, 0)).rgb
+         + texture(uSrc, uv + t * vec2(-1, 1)).rgb + 2.0 * texture(uSrc, uv + t * vec2(0, 1)).rgb + texture(uSrc, uv + t * vec2(1, 1)).rgb;
+  fragColor = vec4(texture(uBase, uv).rgb + uW * s / 16.0, 1.0);
+}
+#endif
+
+#ifdef PASS_FINAL
+// 全分辨率：辉光叠加 → 中间视觉（Purkinje：暗处向视杆细胞过渡，去饱和、偏蓝）→ AgX → sRGB → 抖动
+uniform sampler2D uHDR;
+uniform sampler2D uBloom;
+uniform sampler2D uExpo;
+uniform vec2 uOutRes;
+uniform float uBloomK, uPurkinje;
+vec3 agx(vec3 c) {
+  const mat3 inM = mat3(0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+                        0.0784335999999992, 0.878468636469772, 0.0784336,
+                        0.0792237451477643, 0.0791661274605434, 0.879142973793104);
+  const mat3 outM = mat3(1.19687900512017, -0.0528968517574562, -0.0529716355144438,
+                         -0.0980208811401368, 1.15190312990417, -0.0980434501171241,
+                         -0.0990297440797205, -0.0989611768448433, 1.15107367264116);
+  c = inM * max(c, vec3(1e-10));
+  c = clamp((log2(c) + 12.47393) / 16.5, 0.0, 1.0);
+  vec3 x2 = c * c, x4 = x2 * x2;
+  c = 15.5 * x4 * x2 - 40.14 * x4 * c + 31.96 * x4 - 6.868 * x2 * c + 0.4298 * x2 + 0.1191 * c - 0.00232;
+  c = outM * c;
+  return pow(max(c, 0.0), vec3(2.2));                       // AgX 输出是显示编码，这里回到线性再统一编码
+}
+// Catmull–Rom 五点双三次：从渲染分辨率放大到屏幕分辨率
+vec3 bicubic(sampler2D t, vec2 uv) {
+  vec2 sz = vec2(textureSize(t, 0)), p = uv * sz - 0.5, f = fract(p), c = floor(p) + 0.5;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f), w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
+  vec2 w12 = w1 + w2, o12 = c + w2 / w12, o0 = c - 1.0, o3 = c + 2.0;
+  o0 /= sz; o3 /= sz; o12 /= sz;
+  vec3 r = (texture(t, vec2(o12.x, o0.y)).rgb * w12.x * w0.y)
+         + (texture(t, vec2(o0.x, o12.y)).rgb * w0.x * w12.y + texture(t, o12).rgb * w12.x * w12.y + texture(t, vec2(o3.x, o12.y)).rgb * w3.x * w12.y)
+         + (texture(t, vec2(o12.x, o3.y)).rgb * w12.x * w3.y);
+  return max(r / (w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y), 0.0);
+}
+vec3 toSRGB(vec3 c) { return mix(12.92 * c, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+void main() {
+  vec2 uv = gl_FragCoord.xy / uOutRes;
+  vec3 c = bicubic(uHDR, uv);
+  c += uBloomK * texture(uBloom, uv).rgb;
+  vec2 ex = texelFetch(uExpo, ivec2(0), 0).xy;
+  // 中间视觉：按“适应亮度”（cd/m²）在 0.003～3 之间对数插值
+  float s = uPurkinje * (1.0 - smoothstep(log(0.003), log(3.0), log(max(ex.y, 1e-6))));
+  if (s > 0.0) {
+    mat3 toXYZ = mat3(0.4124, 0.2126, 0.0193, 0.3576, 0.7152, 0.1192, 0.1805, 0.0722, 0.9505);
+    vec3 xyz = toXYZ * c;
+    float V = max(xyz.y * (1.33 * (1.0 + (xyz.y + xyz.z) / max(xyz.x, 1e-6)) - 1.68), 0.0);   // Jensen 2000 视杆亮度
+    c = mix(c, V * vec3(0.82, 0.92, 1.15) * 0.75, s * 0.85);
+  }
+  vec3 o = toSRGB(agx(c));
+  float n = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  fragColor = vec4(o + (n - 0.5) / 255.0, 1.0);
+}
+#endif
+</script>
+<script>
+'use strict';
+const TAU = Math.PI * 2, D2R = Math.PI / 180;
+const $ = id => document.getElementById(id);
+const src = id => $(id).textContent;
+const cv = $('c');
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, depth: false, preserveDrawingBuffer: true });
+const LOG = [];
+function log(s) { LOG.push(s); console.log(s); }
+if (!gl) { document.body.innerHTML = '<p style="color:#f88;padding:20px">没有 WebGL2</p>'; throw new Error('no webgl2'); }
+const extCBF = gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+const extPar = gl.getExtension('KHR_parallel_shader_compile');
+
+// ---------------- 参数 ----------------
+const P = {
+  R: 6371, a: 600, gEq: 1.4, gLight: 0.75, gHeavy: 1.2, limboKm: 330,
+  Y: 360, M: 32, rs: 640, rm: 6371 / 2, A: 6371 / 2, rhoS: 20, rhoM: 100,
+  sunLux: 128000, sunRef: 5731,
+  HR: 40, HM: 6, V: 200, mieG: 0.76, atmo: 1,
+  mode: 1, W: 1.5, Hc: 99, cliff: 0.07, wig: 0.35, cliffJit: 0.07, veil: 0, disp: 1.0, abyssDepth: 30, abyssHalf: 220,
+  cloud: 1, cloudBase: 1.5, cloudTop: 6.5, cover: 0.42, cloudSigma: 22, ruiOvercast: 1.0, ruiRad: 900, rain: 0.03, wet: 0.7,
+  towerAlb: 0.0, moonAlb: 0.12,
+  s: 6670, lon: -4, eye: 0.0017, yaw: 180, pitch: 10, fov: 70,
+  t: 3 * 360 + 295 + 0.5 + 4 / 360, EV: 0, lock: 0, lockEV: 12, purkinje: 1, adaptMin: 0.003, adaptMax: 1e5,
+  scale: 0.5, quality: 'mid', frames: 0, bloom: 0.02
+};
+const QUALITY = {
+  low:  { Q_ATM_NEAR: 8,  Q_ATM_FAR: 6,  Q_TER_STEPS: 56,  Q_NEAR_KM: '40.0',  Q_SHADOW_STEPS: 10, Q_CLOUD_STEPS: 16, Q_CLOUD_LIGHT: 2 },
+  mid:  { Q_ATM_NEAR: 14, Q_ATM_FAR: 10, Q_TER_STEPS: 96,  Q_NEAR_KM: '80.0',  Q_SHADOW_STEPS: 20, Q_CLOUD_STEPS: 32, Q_CLOUD_LIGHT: 4 },
+  high: { Q_ATM_NEAR: 24, Q_ATM_FAR: 16, Q_TER_STEPS: 160, Q_NEAR_KM: '150.0', Q_SHADOW_STEPS: 32, Q_CLOUD_STEPS: 64, Q_CLOUD_LIGHT: 6 }
+};
+
+// ---------------- 天体（方案乙：日月对称双螺旋） ----------------
+function sunAt(t) { const lam = Math.PI + TAU * t; return [P.rs * Math.cos(lam), P.A * Math.sin(TAU * t / P.Y), P.rs * Math.sin(lam)]; }
+function moonAt(t) { const lam = TAU * t * (1 - 1 / P.M); return [P.rm * Math.cos(lam), -P.A * Math.sin(TAU * t / P.Y), P.rm * Math.sin(lam)]; }
+
+// ---------------- 向量 ----------------
+const v3 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+  mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s], dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  len: a => Math.hypot(a[0], a[1], a[2]), norm: a => { const l = Math.hypot(a[0], a[1], a[2]); return [a[0] / l, a[1] / l, a[2] / l]; } };
+const smooth = (a, b, x) => { const u = Math.min(1, Math.max(0, (x - a) / (b - a))); return u * u * (3 - 2 * u); };
+
+// CPU 版遮挡（与着色器同式）
+function bodyVisTower(X, S, rho) {
+  const px = X[0], pz = X[2], rp2 = px * px + pz * pz, a2 = P.a * P.a;
+  if (rp2 <= a2) return 0;
+  const rp = Math.sqrt(rp2), qx = S[0] - px, qz = S[2] - pz, Lh = Math.hypot(qx, qz);
+  if (Lh < 1e-3) return 1;
+  const cx = -px / rp, cz = -pz / rp, cosA = (qx * cx + qz * cz) / Lh;
+  if (cosA <= 0) return 1;
+  const sinA = Math.abs(cx * qz - cz * qx) / Lh, sd = P.a / rp, cd = Math.sqrt(Math.max(0, 1 - sd * sd));
+  const u = Lh * (sinA * cd - cosA * sd) / rho;
+  if (u >= 1) return 1;
+  if (sinA < sd) { const tHit = rp * cosA - Math.sqrt(Math.max(a2 - rp2 * sinA * sinA, 0)); if (Lh < tHit) return 1; }
+  else if (Lh < rp * cd) return 1;
+  if (u <= -1) return 0;
+  return 0.5 + (u * Math.sqrt(1 - u * u) + Math.asin(u)) / Math.PI;
+}
+
+// ---------------- 程序噪声 ----------------
+function hash2(i, j, s) { let h = (i * 374761393 + j * 668265263 + s * 2147483647) | 0; h = (h ^ (h >>> 13)) * 1274126177 | 0; h = h ^ (h >>> 16); return (h >>> 0) / 4294967296; }
+function hash3(i, j, k, s) { let h = (i * 374761393 + j * 668265263 + k * 1440662683 + s * 2654435761) | 0; h = (h ^ (h >>> 13)) * 1274126177 | 0; h = h ^ (h >>> 16); return (h >>> 0) / 4294967296; }
+const fade5 = t => t * t * t * (t * (t * 6 - 15) + 10);
+function perlin2(x, y, per, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const g = (i, j) => { const a = hash2(((i % per) + per) % per, ((j % per) + per) % per, seed) * TAU; return [Math.cos(a), Math.sin(a)]; };
+  const d = (i, j, dx, dy) => { const gg = g(i, j); return gg[0] * dx + gg[1] * dy; };
+  const u = fade5(xf), v = fade5(yf);
+  const n00 = d(xi, yi, xf, yf), n10 = d(xi + 1, yi, xf - 1, yf), n01 = d(xi, yi + 1, xf, yf - 1), n11 = d(xi + 1, yi + 1, xf - 1, yf - 1);
+  return (n00 + u * (n10 - n00) + v * (n01 - n00) + u * v * (n00 - n10 - n01 + n11)) * 1.414;
+}
+function makeHeight(N) {
+  const H = new Float32Array(N * N), M = new Float32Array(N * N);
+  const F = 32;  // 32 个特征/平铺
+  let mn = 1e9, mx = -1e9;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = i / N, y = j / N;
+    let f = 0, a = 1, per = F, ridge = 0;
+    for (let o = 0; o < 4; o++) { const n = perlin2(x * per, y * per, per, 11 + o); f += a * n; ridge += a * (1 - Math.abs(n)); a *= 0.5; per *= 2; }
+    const h = 0.55 * f + 0.45 * (ridge - 0.9);
+    H[j * N + i] = h; mn = Math.min(mn, h); mx = Math.max(mx, h);
+    let m = 0; a = 1; per = 16;
+    for (let o = 0; o < 3; o++) { m += a * perlin2(x * per, y * per, per, 77 + o); a *= 0.5; per *= 2; }
+    M[j * N + i] = 0.5 + 0.5 * m;
+  }
+  const out = new Float32Array(N * N * 4);
+  for (let k = 0; k < N * N; k++) H[k] = 2 * (H[k] - mn) / (mx - mn) - 1;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const k = j * N + i, ip = j * N + (i + 1) % N, im = j * N + (i + N - 1) % N, jp = ((j + 1) % N) * N + i, jm = ((j + N - 1) % N) * N + i;
+    out[4 * k] = H[k]; out[4 * k + 1] = (H[ip] - H[im]) * 0.5 * N; out[4 * k + 2] = (H[jp] - H[jm]) * 0.5 * N; out[4 * k + 3] = Math.min(1, Math.max(0, M[k]));
+  }
+  return { N, data: out, H };
+}
+function sampleH(T, u, v) {  // 与 GL LINEAR+REPEAT 一致
+  const N = T.N; let x = u * N - 0.5, y = v * N - 0.5;
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+  const g = (i, j) => T.H[(((j % N) + N) % N) * N + (((i % N) + N) % N)];
+  return (g(x0, y0) * (1 - fx) + g(x0 + 1, y0) * fx) * (1 - fy) + (g(x0, y0 + 1) * (1 - fx) + g(x0 + 1, y0 + 1) * fx) * fy;
+}
+function make3D(N) {
+  const out = new Uint8Array(N * N * N * 4);
+  const worley = (x, y, z, cells, seed) => {
+    const xi = Math.floor(x * cells), yi = Math.floor(y * cells), zi = Math.floor(z * cells);
+    let best = 9;
+    for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const cx = xi + dx, cy = yi + dy, cz = zi + dz;
+      const wx = ((cx % cells) + cells) % cells, wy = ((cy % cells) + cells) % cells, wz = ((cz % cells) + cells) % cells;
+      const px = (cx + hash3(wx, wy, wz, seed)) / cells, py = (cy + hash3(wx, wy, wz, seed + 1)) / cells, pz = (cz + hash3(wx, wy, wz, seed + 2)) / cells;
+      const d = Math.hypot(px - x, py - y, pz - z) * cells; if (d < best) best = d;
+    }
+    return Math.max(0, 1 - best);
+  };
+  const perlin3 = (x, y, z, per, seed) => {
+    const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), xf = x - xi, yf = y - yi, zf = z - zi;
+    const gr = (i, j, k) => { i = ((i % per) + per) % per; j = ((j % per) + per) % per; k = ((k % per) + per) % per;
+      const th = hash3(i, j, k, seed) * TAU, zz = hash3(i, j, k, seed + 9) * 2 - 1, r = Math.sqrt(1 - zz * zz); return [r * Math.cos(th), r * Math.sin(th), zz]; };
+    const dd = (i, j, k, dx, dy, dz) => { const g = gr(i, j, k); return g[0] * dx + g[1] * dy + g[2] * dz; };
+    const u = fade5(xf), v = fade5(yf), w = fade5(zf);
+    const L = (a, b, t) => a + (b - a) * t;
+    return L(L(L(dd(xi, yi, zi, xf, yf, zf), dd(xi + 1, yi, zi, xf - 1, yf, zf), u), L(dd(xi, yi + 1, zi, xf, yf - 1, zf), dd(xi + 1, yi + 1, zi, xf - 1, yf - 1, zf), u), v),
+             L(L(dd(xi, yi, zi + 1, xf, yf, zf - 1), dd(xi + 1, yi, zi + 1, xf - 1, yf, zf - 1), u), L(dd(xi, yi + 1, zi + 1, xf, yf - 1, zf - 1), dd(xi + 1, yi + 1, zi + 1, xf - 1, yf - 1, zf - 1), u), v), w);
+  };
+  for (let k = 0; k < N; k++) for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = (i + 0.5) / N, y = (j + 0.5) / N, z = (k + 0.5) / N;
+    let p = 0, a = 1, per = 4, an = 0;
+    for (let o = 0; o < 3; o++) { p += a * perlin3(x * per, y * per, z * per, per, 3 + o); an += a; a *= 0.5; per *= 2; }
+    p = 0.5 + 0.5 * p / an * 1.6;
+    const w1 = worley(x, y, z, 4, 101), w2 = worley(x, y, z, 8, 202), w3 = worley(x, y, z, 16, 303);
+    const pw = Math.min(1, Math.max(0, p * 0.65 + (w1 * 0.625 + w2 * 0.25 + w3 * 0.125) * 0.45 - 0.05));
+    const o4 = 4 * (k * N * N + j * N + i);
+    out[o4] = pw * 255; out[o4 + 1] = w1 * 255; out[o4 + 2] = w2 * 255; out[o4 + 3] = w3 * 255;
+  }
+  return out;
+}
+
+// ---------------- GL 小工具 ----------------
+const VS = '#version 300 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0.0,1.0);}';
+function compile(type, s, name) {
+  const sh = gl.createShader(type); gl.shaderSource(sh, s); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { const e = gl.getShaderInfoLog(sh); log('编译失败 ' + name + ':\n' + e); throw new Error(name + ': ' + e); }
+  return sh;
+}
+function program(fs, name) {
+  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, VS, 'vs')); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs, name)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { const e = gl.getProgramInfoLog(p); log('链接失败 ' + name + ': ' + e); throw new Error(e); }
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); const nm = info.name.replace(/\[0\]$/, ''); u[nm] = gl.getUniformLocation(p, info.name); }
+  return { p, u, name };
+}
+function defs(q) { return Object.entries(q).map(([k, v]) => '#define ' + k + ' ' + v).join('\n') + '\n'; }
+function tex2D(w, h, internal, format, type, data, filter, wrap) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, data || null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  return t;
+}
+function rt(w, h, filter) {
+  const t = tex2D(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, null, filter || gl.LINEAR, gl.CLAMP_TO_EDGE);
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { t, f, w, h };
+}
+
+// ---------------- 资源 ----------------
+let T0 = performance.now();
+const HM = makeHeight(512);
+const texH = tex2D(512, 512, gl.RGBA16F, gl.RGBA, gl.FLOAT, HM.data, gl.LINEAR, gl.REPEAT);
+log('高度图 ' + (performance.now() - T0).toFixed(0) + ' ms'); T0 = performance.now();
+const N3 = 64, n3data = make3D(N3);
+const tex3 = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, tex3);
+gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, N3, N3, N3, 0, gl.RGBA, gl.UNSIGNED_BYTE, n3data);
+gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+[gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R].forEach(w => gl.texParameteri(gl.TEXTURE_3D, w, gl.REPEAT));
+log('三维噪声 ' + (performance.now() - T0).toFixed(0) + ' ms');
+
+const rtMS = rt(32, 32), rtProbe = rt(32, 16, gl.NEAREST), rtSH = rt(9, 1, gl.NEAREST);
+const rtExp = [rt(1, 1, gl.NEAREST), rt(1, 1, gl.NEAREST)];
+const texBlack = tex2D(1, 1, gl.RGBA16F, gl.RGBA, gl.FLOAT, new Float32Array(4), gl.NEAREST, gl.CLAMP_TO_EDGE);
+let rtHDR = null;
+let progs = {};
+function buildPrograms() {
+  const q = defs(QUALITY[P.quality]);
+  const head = '#version 300 es\n' + q;
+  const T = performance.now();
+  progs.main = program(head + src('glsl-common') + '\n' + src('glsl-main'), 'main');
+  progs.probe = program(head + src('glsl-common') + '\n' + src('glsl-probe'), 'probe');
+  progs.ms = program(head + src('glsl-common') + '\n' + src('glsl-mslut'), 'mslut');
+  progs.sh = program('#version 300 es\n#define PASS_SH\n' + src('glsl-post'), 'sh');
+  progs.expo = program('#version 300 es\n#define PASS_EXPO\n' + src('glsl-post'), 'expo');
+  progs.fin = program('#version 300 es\n#define PASS_FINAL\n' + src('glsl-post'), 'final');
+  progs.taa = program('#version 300 es\n#define PASS_TAA\n' + src('glsl-post'), 'taa');
+  progs.bd = program('#version 300 es\n#define PASS_BLOOM_DOWN\n' + src('glsl-post'), 'bd');
+  progs.bu = program('#version 300 es\n#define PASS_BLOOM_UP\n' + src('glsl-post'), 'bu');
+  log('编译 ' + (performance.now() - T).toFixed(0) + ' ms（' + P.quality + '）');
+}
+
+// ---------------- 场景量 ----------------
+const LAYER_L = [6.0, 1.1, 0.2, 0.035, 0.006], LAYER_A = [0.32, 0.085, 0.018, 0.0032, 0.0007], TF = 32;
+function trench(y) { return P.abyssDepth * (1 - smooth(P.abyssHalf * 0.55, P.abyssHalf, Math.abs(y))); }
+function sawS(f) { return (f - 0.5) - smooth(1 - P.cliff, 1, f); }
+const fract = x => x - Math.floor(x);
+const fr = Math.fround;
+function scene() {
+  const R = P.R, psi = P.s / R, lam = P.lon * D2R;
+  const ySph = -R * Math.cos(psi);
+  const rS = R * Math.sin(psi);
+  const g = P.gEq * rS / R;
+  const zw = [1 - smooth(P.gLight - 0.04, P.gLight + 0.04, g), 0, smooth(P.gHeavy - 0.04, P.gHeavy + 0.04, g), 0];
+  zw[1] = Math.max(0, 1 - zw[0] - zw[2]);
+  const ruiDir = (() => { const ps = 6670 / R, la = -4 * D2R; return [Math.sin(ps) * Math.cos(la), -Math.cos(ps), Math.sin(ps) * Math.sin(la)]; })();
+  const ruiRad = P.ruiRad / R;
+  const dirP = [Math.sin(psi) * Math.cos(lam), -Math.cos(psi), Math.sin(psi) * Math.sin(lam)];
+  const cdR = v3.dot(dirP, ruiDir);
+  zw[3] = smooth(Math.cos(ruiRad), Math.cos(ruiRad * 0.75), cdR);
+  const limboW = 1 - smooth(P.limboKm * 0.8, P.limboKm, Math.abs(ySph));
+  let zoneAmp = (zw[0] * 1.6 + zw[1] * 0.7 + zw[2] * 1.0);
+  zoneAmp = zoneAmp * (1 - zw[3]) + 1.25 * zw[3];
+  zoneAmp = zoneAmp * (1 - limboW) + 0.4 * limboW;
+  const amp = zoneAmp * P.disp;
+  // 噪声原点（相机全球地表坐标，双精度取模）
+  const cg = [-rS * lam, -P.s];
+  const org = [];
+  for (let k = 0; k < 5; k++) {
+    const an = k * 1.31, c = Math.cos(an), s = Math.sin(an), sc = 1 / (LAYER_L[k] * TF);
+    org.push(fract((c * cg[0] - s * cg[1]) * sc), fract((s * cg[0] + c * cg[1]) * sc));
+  }
+  let D = 0;
+  for (let k = 0; k < 5; k++) D += LAYER_A[k] * amp * sampleH(HM, org[2 * k], org[2 * k + 1]);
+  // 阶地：有符号崖高（不超过踏面宽 × tan 纬度，赤道附近自然消失）
+  const tanLat = Math.abs(ySph) / Math.max(rS, 1);
+  const HcS = (ySph < 0 ? 1 : -1) * Math.min(P.Hc, P.W * tanLat);
+  const wigS = 1 / (10 * P.W * TF);
+  const wigOrg = [fract(cg[0] * wigS), fract(cg[1] * wigS)];
+  const w0 = sampleH(HM, wigOrg[0], wigOrg[1]);
+  const b0 = sampleH(HM, org[2], org[3]);
+  const camF = fract(ySph / P.W + P.wig * w0 + P.cliffJit * b0);
+  let Pc;
+  if (P.mode === 1) {
+    const y = ySph;
+    const rb = Math.sqrt(R * R - y * y) - HcS * sawS(camF) + trench(y);
+    const r = rb - (D + P.eye);
+    Pc = [r * Math.cos(lam), y, r * Math.sin(lam)];
+  } else {
+    const rho = R + trench(ySph) - (D + P.eye);
+    Pc = v3.mul(dirP, rho);
+  }
+  Pc = Pc.map(fr);
+  const rho = v3.len(Pc), r0 = Math.hypot(Pc[0], Pc[2]), yP = Pc[1];
+  const rsP = Math.sqrt(R * R - yP * yP);
+  const altS = R + trench(yP) - rho;
+  const altT = rsP - HcS * sawS(camF) + trench(yP) - r0;
+  const U = [-Pc[0] / r0, 0, -Pc[2] / r0], Nn = [0, -1, 0], E = v3.cross(Nn, U);
+  const yaw = P.yaw * D2R, pit = Math.min(89.5, Math.max(-89.5, P.pitch)) * D2R;
+  const fwd = v3.add(v3.mul(v3.add(v3.mul(Nn, Math.cos(yaw)), v3.mul(E, Math.sin(yaw))), Math.cos(pit)), v3.mul(U, Math.sin(pit)));
+  const right = v3.norm(v3.cross(fwd, U)), up = v3.cross(right, fwd);
+  // 日月
+  const S = sunAt(P.t), Mo = moonAt(P.t);
+  const sunCol = [1.0, 0.97, 0.92]; const sl = 0.2126 * sunCol[0] + 0.7152 * sunCol[1] + 0.0722 * sunCol[2];
+  const sunI = sunCol.map(c => c / sl * P.sunLux * P.sunRef * P.sunRef);
+  // 大气系数
+  const betaR = [5.802e-3, 13.558e-3, 33.1e-3];
+  const bM = Math.max(3.912 / P.V - betaR[1], 0);
+  const betaM = bM * 0.9, betaMA = bM * 0.1;
+  const hcut = Math.min(12 * Math.max(P.HR, P.HM), 1500);
+  const ambK = betaR.map(b => { const tau = b * P.HR + bM * P.HM; return 0.55 * (1 - Math.exp(-tau)); });
+  // 月：照度（Lambert 球相位积分 × 月心塔影可见度）、壁照（L1）、本体系
+  const toObs = v3.sub(Pc, Mo), Dm = v3.len(toObs), toSun = v3.sub(S, Mo), Ds = v3.len(toSun);
+  const phi = Math.acos(Math.max(-1, Math.min(1, v3.dot(toObs, toSun) / (Dm * Ds))));
+  const visM = bodyVisTower(Mo, S, P.rhoS);
+  const Esm = P.sunLux * (P.sunRef / Ds) ** 2;
+  let W0 = [0, 0, 0], W1 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  { // 壁照：内壁 400 个面元
+    const NQ = 400; let F = 0; const V = [0, 0, 0];
+    for (let i = 0; i < NQ; i++) {
+      const z = 1 - 2 * (i + 0.5) / NQ, ph = i * 2.39996323, rr = Math.sqrt(1 - z * z);
+      const Wp = [R * rr * Math.cos(ph), R * z, R * rr * Math.sin(ph)];
+      if (Math.hypot(Wp[0], Wp[2]) < P.a) continue;
+      const nW = v3.mul(Wp, -1 / R);
+      const ls = v3.sub(S, Wp), dS = v3.len(ls), muS = v3.dot(ls, nW) / dS;
+      if (muS <= 0) continue;
+      const vis = bodyVisTower(Wp, S, P.rhoS); if (vis <= 0) continue;
+      const Ew = P.sunLux * (P.sunRef / dS) ** 2 * muS * vis * 0.7;
+      const Lw = 0.16 / Math.PI * Ew;
+      const toM = v3.sub(Mo, Wp), dM = v3.len(toM), cw = v3.dot(toM, nW) / dM;
+      if (cw <= 0 || bodyVisTower(Mo, Wp, 1) < 0.5) continue;
+      const dOm = 4 * Math.PI * R * R / NQ * cw / (dM * dM);
+      const om = v3.mul(toM, -1 / dM);
+      F += Lw * dOm; V[0] += Lw * dOm * om[0]; V[1] += Lw * dOm * om[1]; V[2] += Lw * dOm * om[2];
+    }
+    W0 = [0.25 * F, 0.25 * F, 0.25 * F];
+    W1 = [0.5 * V[0], 0.5 * V[1], 0.5 * V[2]];
+  }
+  const nOM = v3.mul(toObs, 1 / Dm);
+  const Ewo = Math.max(0, W0[0] + W1[0] * nOM[0] + W1[1] * nOM[1] + W1[2] * nOM[2]);
+  const moonLux = (2 / 3) * P.moonAlb * Esm * visM * (P.rhoM / Dm) ** 2 * (Math.sin(phi) + (Math.PI - phi) * Math.cos(phi)) / Math.PI
+               + P.moonAlb * Ewo * (P.rhoM / Dm) ** 2;
+  const mAx = v3.norm([-Mo[0], 0, -Mo[2]]), mUp = [0, 1, 0], mT = v3.cross(mAx, mUp);
+  return { Pc, rho, r0, yP, rsP, altS, altT, HcS, U, Nn, E, fwd, right, up, S, Mo, sunI, betaR, betaM, betaMA, hcut, ambK,
+           zw, limboW, zoneAmp, org, ruiDir, wigS, wigOrg, w0, camF, b0, ruiRad, moonLux, Dm, W0, W1, mAx, mUp, mT, visM, phi, D, amp };
+}
+
+function setCommon(pr, sc, w, h) {
+  const u = pr.u; const f1 = (n, v) => u[n] && gl.uniform1f(u[n], v); const f3 = (n, v) => u[n] && gl.uniform3f(u[n], v[0], v[1], v[2]);
+  if (u.uRes) gl.uniform2f(u.uRes, w, h);
+  if (u.uJitter) gl.uniform2f(u.uJitter, 0, 0);
+  if (u.uFrame) gl.uniform1i(u.uFrame, P.frames);
+  f1('uClock', performance.now() / 1000);
+  f3('uCamPos', sc.Pc); f3('uCamRight', sc.right); f3('uCamUp', sc.up); f3('uCamFwd', sc.fwd);
+  f1('uTanHalfFov', Math.tan(P.fov * D2R / 2));
+  f1('uCamC0', sc.rho * sc.rho - P.R * P.R); f1('uCamRho', sc.rho); f1('uCamR0', sc.r0);
+  f1('uCamAltS', sc.altS); f1('uCamAltT', sc.altT); f1('uRsphP', sc.rsP); f1('uCamFy', sc.camF); f1('uTerWig', P.wig); f1('uWigS', sc.wigS); f1('uW0', sc.w0); f1('uB0', sc.b0); f1('uCliffJit', P.cliffJit); if (u.uWigOrg) gl.uniform2f(u.uWigOrg, sc.wigOrg[0], sc.wigOrg[1]); f1('uVeilK', P.veil / 1000); f1('uTrenchP', trench(sc.yP));
+  f3('uFrameE', sc.E); f3('uFrameN', sc.Nn); f3('uFrameU', sc.U);
+  if (u.uLayerOrg) gl.uniform2fv(u.uLayerOrg, new Float32Array(sc.org));
+  f1('uZoneAmp', sc.zoneAmp); if (u.uZoneW) gl.uniform4f(u.uZoneW, sc.zw[0], sc.zw[1], sc.zw[2], sc.zw[3]);
+  f1('uLimboW', sc.limboW);
+  f1('uLip', 1.2 * LAYER_A.reduce((acc, A, k) => acc + 3 * A / LAYER_L[k], 0) * sc.amp + 0.05);
+  f1('uClearMax', (LAYER_A.reduce((a, b) => a + b, 0)) * sc.amp + 0.6 * Math.abs(sc.HcS) + 0.02);
+  f1('uR', P.R); f1('uA', P.a); f1('uGEq', P.gEq); f1('uGLight', P.gLight); f1('uGHeavy', P.gHeavy); f1('uLimboKm', P.limboKm);
+  f3('uSunPos', sc.S); f1('uSunRad', P.rhoS); f3('uSunI', sc.sunI);
+  f3('uMoonPos', sc.Mo); f1('uMoonRad', P.rhoM); f1('uMoonAlb', P.moonAlb);
+  if (u.uMoonBasis) gl.uniformMatrix3fv(u.uMoonBasis, false, new Float32Array([...sc.mAx, ...sc.mUp, ...sc.mT]));
+  f3('uMoonW0', sc.W0);
+  if (u.uMoonW1) gl.uniformMatrix3fv(u.uMoonW1, false, new Float32Array([sc.W1[0], sc.W1[0], sc.W1[0], sc.W1[1], sc.W1[1], sc.W1[1], sc.W1[2], sc.W1[2], sc.W1[2]]));
+  f3('uMoonE', [sc.moonLux, sc.moonLux, sc.moonLux]); f1('uMoonD2', sc.Dm * sc.Dm);
+  f1('uAtmoOn', P.atmo); f3('uBetaR', sc.betaR); f1('uBetaM', sc.betaM); f1('uBetaMA', sc.betaMA);
+  f1('uHR', P.HR); f1('uHM', P.HM); f1('uMieG', P.mieG); f1('uHcut', sc.hcut); f1('uRainBeta', P.rain); f3('uAmbK', sc.ambK);
+  if (u.uGroundMode) gl.uniform1i(u.uGroundMode, P.mode);
+  if (u.uDebug) gl.uniform1i(u.uDebug, P.debug || 0);
+  f1('uTerW', P.W); f1('uHcS', sc.HcS); f1('uCliffFrac', P.cliff); f1('uDispScale', P.disp);
+  f1('uAbyssDepth', P.abyssDepth); f1('uAbyssHalf', P.abyssHalf); f3('uRuiDir', sc.ruiDir); f1('uRuiRad', sc.ruiRad); f1('uWet', P.wet);
+  f1('uCloudOn', P.cloud); f1('uCloudBase', P.cloudBase); f1('uCloudTop', P.cloudTop); f1('uCloudCover', P.cover); f1('uCloudSigma', P.cloudSigma); f1('uRuiOvercast', P.ruiOvercast);
+  f3('uWind', [P.t * 0.9, P.t * 0.13, 0.25 * Math.sin(P.t * 0.05)]);
+  f1('uTowerAlb', P.towerAlb);
+  // 纹理单元
+  const bindT = (name, unit, target, t) => { if (u[name]) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(target, t); gl.uniform1i(u[name], unit); } };
+  bindT('uMSLut', 0, gl.TEXTURE_2D, rtMS.t); bindT('uSkySH', 1, gl.TEXTURE_2D, rtSH.t); bindT('uHeightTex', 2, gl.TEXTURE_2D, texH);
+  bindT('uNoise3D', 3, gl.TEXTURE_3D, tex3); bindT('uExpTex', 4, gl.TEXTURE_2D, rtExp[expIdx].t);
+}
+
+let expIdx = 0, lastT = performance.now(), msDirty = true;
+function draw(target, w, h) { gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.f : null); gl.viewport(0, 0, w, h); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+const vao = gl.createVertexArray();
+function resize() {
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  const W = Math.round(cv.clientWidth * dpr), H = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const rw = Math.max(16, Math.round(W * P.scale)), rh = Math.max(16, Math.round(H * P.scale));
+  if (!rtHDR || rtHDR.w !== rw || rtHDR.h !== rh) rtHDR = rt(rw, rh, gl.LINEAR);
+}
+let bloomDown = [], bloomUp = [];
+function ensureBloom() {
+  if (bloomDown.length && bloomDown[0].w === Math.max(1, rtHDR.w >> 1) && bloomDown[0].h === Math.max(1, rtHDR.h >> 1)) return;
+  bloomDown = []; bloomUp = [];
+  let w = rtHDR.w, h = rtHDR.h;
+  for (let i = 0; i < 5; i++) { w = Math.max(1, w >> 1); h = Math.max(1, h >> 1); bloomDown.push(rt(w, h, gl.LINEAR)); if (i < 4) bloomUp.push(rt(w, h, gl.LINEAR)); }
+}
+function runBloom() {
+  ensureBloom();
+  let srcT = rtHDR;
+  gl.useProgram(progs.bd.p);
+  for (let i = 0; i < 5; i++) {
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcT.t); gl.uniform1i(progs.bd.u.uSrc, 0);
+    gl.uniform2f(progs.bd.u.uSrcTexel, 1 / srcT.w, 1 / srcT.h); gl.uniform1f(progs.bd.u.uFirst, i === 0 ? 1 : 0);
+    draw(bloomDown[i], bloomDown[i].w, bloomDown[i].h); srcT = bloomDown[i];
+  }
+  gl.useProgram(progs.bu.p);
+  let cur = bloomDown[4];
+  for (let i = 3; i >= 0; i--) {
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, cur.t); gl.uniform1i(progs.bu.u.uSrc, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomDown[i].t); gl.uniform1i(progs.bu.u.uBase, 1);
+    gl.uniform2f(progs.bu.u.uSrcTexel, 1 / cur.w, 1 / cur.h); gl.uniform1f(progs.bu.u.uW, 1.0);
+    draw(bloomUp[i], bloomUp[i].w, bloomUp[i].h); cur = bloomUp[i];
+  }
+  return cur;
+}
+let gpuMs = 0, timer = gl.getExtension('EXT_disjoint_timer_query_webgl2'), q = null;
+function frame(adaptFully) {
+  resize();
+  gl.bindVertexArray(vao);
+  const sc = scene();
+  if (msDirty) { gl.useProgram(progs.ms.p); setCommon(progs.ms, sc, 32, 32); draw(rtMS, 32, 32); msDirty = false; }
+  // 探针 → SH
+  gl.useProgram(progs.probe.p); setCommon(progs.probe, sc, 32, 16); draw(rtProbe, 32, 16);
+  gl.useProgram(progs.sh.p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtProbe.t); gl.uniform1i(progs.sh.u.uProbe, 0); draw(rtSH, 9, 1);
+  // 主 pass
+  if (timer && !q) { q = gl.createQuery(); gl.beginQuery(timer.TIME_ELAPSED_EXT, q); }
+  gl.useProgram(progs.main.p); setCommon(progs.main, sc, rtHDR.w, rtHDR.h); draw(rtHDR, rtHDR.w, rtHDR.h);
+  if (timer && q && !q._ended) { gl.endQuery(timer.TIME_ELAPSED_EXT); q._ended = true; }
+  // 曝光
+  const now = performance.now(); const dt = adaptFully ? 30 : Math.min(0.2, (now - lastT) / 1000); lastT = now;
+  gl.useProgram(progs.expo.p);
+  const ue = progs.expo.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtHDR.t); gl.uniform1i(ue.uHDR, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, rtExp[expIdx].t); gl.uniform1i(ue.uPrev, 1);
+  gl.uniform1f(ue.uDt, dt); gl.uniform1f(ue.uEV, P.EV); gl.uniform1f(ue.uAdaptMin, P.adaptMin); gl.uniform1f(ue.uAdaptMax, P.adaptMax);
+  gl.uniform1f(ue.uLock, P.lock); gl.uniform1f(ue.uLockEV, P.lockEV);
+  draw(rtExp[1 - expIdx], 1, 1); expIdx = 1 - expIdx;
+  // 眩光
+  const bl = P.bloom > 0 ? runBloom() : null;
+  // 输出
+  gl.useProgram(progs.fin.p); const uf = progs.fin.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtHDR.t); gl.uniform1i(uf.uHDR, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bl ? bl.t : texBlack); gl.uniform1i(uf.uBloom, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, rtExp[expIdx].t); gl.uniform1i(uf.uExpo, 2);
+  gl.uniform2f(uf.uOutRes, cv.width, cv.height); gl.uniform1f(uf.uBloomK, P.bloom); gl.uniform1f(uf.uPurkinje, P.purkinje);
+  draw(null, cv.width, cv.height);
+  P.frames++;
+  if (timer && q && q._ended) { if (gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) { gpuMs = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6; gl.deleteQuery(q); q = null; } }
+  return sc;
+}
+function readExpo() { gl.bindFramebuffer(gl.FRAMEBUFFER, rtExp[expIdx].f); const b = new Float32Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, b); return b; }
+function readSH() { gl.bindFramebuffer(gl.FRAMEBUFFER, rtSH.f); const b = new Float32Array(36); gl.readPixels(0, 0, 9, 1, gl.RGBA, gl.FLOAT, b); return b; }
+function readCenterLum() { gl.bindFramebuffer(gl.FRAMEBUFFER, rtHDR.f); const b = new Float32Array(4); gl.readPixels(rtHDR.w >> 1, rtHDR.h >> 1, 1, 1, gl.RGBA, gl.FLOAT, b); return b; }
+
+// ---------------- 交互 ----------------
+let drag = null;
+cv.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; });
+addEventListener('pointerup', () => drag = null);
+addEventListener('pointermove', e => { if (!drag) return; const k = 0.15 * P.fov / 70; P.yaw = (P.yaw - (e.clientX - drag[0]) * k + 360) % 360; P.pitch = Math.max(-89, Math.min(89, P.pitch + (e.clientY - drag[1]) * k)); drag = [e.clientX, e.clientY]; });
+cv.addEventListener('wheel', e => { e.preventDefault(); P.fov = Math.max(5, Math.min(120, P.fov + e.deltaY * 0.03)); }, { passive: false });
+addEventListener('keydown', e => { if (e.key === ',') P.t -= 1 / 96; if (e.key === '.') P.t += 1 / 96; });
+
+let running = true;
+function loop() { if (running) { try { frame(false); hud(); } catch (e) { log(String(e)); running = false; } } requestAnimationFrame(loop); }
+function hud() {
+  const lt = ((P.t - P.lon * D2R / TAU) % 1 + 1) % 1;
+  $('hud').textContent = `s=${P.s} lon=${P.lon} 本地时 ${(lt * 24).toFixed(2)}h  第${Math.floor(P.t % P.Y)}日  yaw ${P.yaw.toFixed(0)} pitch ${P.pitch.toFixed(0)} fov ${P.fov.toFixed(0)}\n` +
+    `GPU 主 pass ${gpuMs.toFixed(1)} ms  ${rtHDR.w}×${rtHDR.h}  ${P.quality}\n` + LOG.slice(-3).join('\n');
+}
+// 测试接口
+window.app = {
+  P, log: LOG, set(o) { Object.assign(P, o); if ('HR' in o || 'HM' in o || 'V' in o || 'mieG' in o) msDirty = true; if ('quality' in o) buildPrograms(); },
+  settle(n) { for (let i = 0; i < (n || 6); i++) frame(true); hud(); return readExpo(); },
+  readSH, readExpo, readCenterLum, scene, readPx(fx, fy) { gl.bindFramebuffer(gl.FRAMEBUFFER, rtHDR.f); const b = new Float32Array(4); gl.readPixels(Math.round(fx * (rtHDR.w - 1)), Math.round(fy * (rtHDR.h - 1)), 1, 1, gl.RGBA, gl.FLOAT, b); const e = readExpo(); return { L: [b[0] / e[0], b[1] / e[0], b[2] / e[0]], t: b[3] }; }, pause() { running = false; }, resume() { running = true; },
+  localNoon(day, frac) { return day + (frac == null ? 0.5 : frac) + P.lon / 360; }
+};
+// 测量辅助：太阳/月亮方位、水平面天空照度（由 SH 算）、若干像素亮度
+app.lookAt = function (t, extra) {
+  app.set(Object.assign({ t }, extra || {})); const sc = scene();
+  const f = Q => { const d = v3.sub(Q, sc.Pc), L = v3.len(d); return { el: Math.asin(v3.dot(d, sc.U) / L) / D2R, az: ((Math.atan2(v3.dot(d, sc.E), v3.dot(d, sc.Nn)) / D2R) + 360) % 360, L }; };
+  return { sun: f(sc.S), moon: f(sc.Mo), visM: sc.visM, phi: sc.phi / D2R, moonLux: sc.moonLux };
+};
+app.Eh = function (n) {
+  const s = readSH(), c = i => s[4 * i + 1], sc = scene(); n = n || sc.U; const x = n[0], y = n[1], z = n[2];
+  const c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
+  return c1 * c(8) * (x * x - y * y) + c3 * c(6) * z * z + c4 * c(0) - c5 * c(6) + 2 * c1 * (c(4) * x * y + c(7) * x * z + c(5) * y * z) + 2 * c2 * (c(3) * x + c(1) * y + c(2) * z);
+};
+app.lumAt = (fx, fy) => { const v = app.readPx(fx, fy); return +(0.2126 * v.L[0] + 0.7152 * v.L[1] + 0.0722 * v.L[2]).toPrecision(3); };
+app.measure = function (t, extra) {
+  const r = app.lookAt(t, Object.assign({ yaw: 90, pitch: 89.4, fov: 60, cloud: 0, rain: 0, wet: 0 }, extra || {})); const e = app.settle(10);
+  return { r, expo: e[0], adapt: e[1], band: app.lumAt(0.5, 0.5), side20: app.lumAt(0.7, 0.5), side40: app.lumAt(0.9, 0.5), Esky: +app.Eh().toPrecision(3) };
+};
+try { buildPrograms(); } catch (e) { running = false; }
+requestAnimationFrame(loop);
+</script></body></html>

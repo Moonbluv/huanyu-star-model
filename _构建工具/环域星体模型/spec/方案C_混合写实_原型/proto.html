@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>环域写实原型</title>
+<style>
+:root{--bg:#0b0d10;--fg:#d9dde3;--mut:#8a929c;--line:#262b33;--acc:#c9a86a}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:12.5px/1.5 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+#ui{position:fixed;left:10px;top:10px;width:270px;max-height:calc(100% - 20px);overflow:auto;background:rgba(11,13,16,.84);border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+#ui h1{font-size:13px;margin:0 0 6px;color:var(--acc);font-weight:600}
+#ui label{display:flex;justify-content:space-between;gap:6px;margin:4px 0;color:var(--mut)}
+#ui label span{color:var(--fg);font-variant-numeric:tabular-nums}
+#ui input[type=range]{width:100%;margin:0}
+#ui select,#ui button{background:#151920;color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:2px 6px;font:inherit}
+#ui .row{display:flex;gap:6px;flex-wrap:wrap;margin:5px 0}
+#hud{position:fixed;right:10px;bottom:10px;background:rgba(11,13,16,.8);border:1px solid var(--line);border-radius:6px;padding:6px 9px;color:var(--mut);font-variant-numeric:tabular-nums;white-space:pre;max-width:60vw}
+#err{position:fixed;inset:auto 10px 10px auto;color:#f88}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="glsl_common.js"></script>
+<script src="glsl_passes.js"></script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <h1>环域 · 生活其中的人看到的样子（原型）</h1>
+  <div class="row"><select id="site"></select><select id="mode"><option value="1">阶地＋峭壁</option><option value="0">顺球面斜坡</option></select></div>
+  <label>年内第几日 <span id="oDay"></span></label><input id="day" type="range" min="0" max="359" step="1">
+  <label>当地时刻 <span id="oHour"></span></label><input id="hour" type="range" min="0" max="24" step="0.05">
+  <label>流速 <span id="oSpd"></span></label><input id="spd" type="range" min="0" max="5" step="1">
+  <label>标高 H <span id="oH"></span></label><input id="H" type="range" min="4" max="60" step="1">
+  <label>近地能见度 V <span id="oV"></span></label><input id="V" type="range" min="20" max="600" step="10">
+  <label>阶地宽 w <span id="oW"></span></label><input id="W" type="range" min="0.5" max="8" step="0.1">
+  <label>云量 <span id="oCov"></span></label><input id="cov" type="range" min="0" max="1" step="0.05">
+  <label>曝光补偿 EV <span id="oEv"></span></label><input id="ev" type="range" min="-3" max="3" step="0.25">
+  <label>画质 <select id="q"><option value="0">低</option><option value="1" selected>中</option><option value="2">高</option></select></label>
+  <div class="row"><button data-look="N">北</button><button data-look="E">东</button><button data-look="S">南</button><button data-look="W">西</button><button data-look="Z">天顶</button><button data-look="sun">太阳</button><button data-look="moon">月</button></div>
+  <div class="row"><label style="margin:0"><input type="checkbox" id="clouds" checked> 云</label><label style="margin:0"><input type="checkbox" id="zuiyu" checked> 罪域阴云</label></div>
+</div>
+<div id="hud"></div>
+<div id="err"></div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const R = 6371, A_T = 600, TAU = Math.PI*2, D2R = Math.PI/180;
+/* ---------- 天体（方案乙：日月对称双螺旋；成品里换成 celestial 模块） ---------- */
+const SKY = {rs:640, rm:R/2, Amp:R/2, Y:360, M:32, rhoS:20, rhoM:90, E0:127, D0:R-640};
+const sunAtW = t => { const l = Math.PI + TAU*t; return [SKY.rs*Math.cos(l), SKY.Amp*Math.sin(TAU*t/SKY.Y), SKY.rs*Math.sin(l)]; };
+const moonAtW = t => { const l = TAU*t*(1 - 1/SKY.M); return [SKY.rm*Math.cos(l), -SKY.Amp*Math.sin(TAU*t/SKY.Y), SKY.rm*Math.sin(l)]; };
+const SITES = [['圣禁城',3600,0],['伊美忒',4000,2],['涅赫莱恩',5600,30],['罪域·啜泣堡',6670,-4],['灵薄带',9500,0]];
+const S = {site:3, mode:1, day:300, hour:15.5, spd:0, H:40, V:200, W:2.0, cov:0.45, ev:0, q:1, clouds:true, zuiyu:true, yaw:180, pitch:20, fov:60, year:0, stand:0.6};
+const SPEEDS = [0, 1, 60, 600, 3600, 14400];
+/* ---------- 噪声体纹理（64³ RGBA8，可平铺）：R＝值噪声 fbm，G＝反 Worley，B/A＝单频值噪声 ---------- */
+const NS = 64;
+function hash3(x, y, z, s) { let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(z, 2147483647) + Math.imul(s, 1274126177)) | 0; h = Math.imul(h ^ (h >>> 13), 1274126177); h ^= h >>> 16; return (h >>> 0) / 4294967296; }
+function vnoiseT(x, y, z, p, s) { // 可平铺值噪声，周期 p（格点数）
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), fx = x - xi, fy = y - yi, fz = z - zi;
+  const u = fx*fx*(3-2*fx), v = fy*fy*(3-2*fy), w = fz*fz*(3-2*fz); const m = a => ((a % p) + p) % p;
+  let r = 0; for (let k = 0; k < 8; k++) { const dx = k & 1, dy = (k >> 1) & 1, dz = k >> 2; r += hash3(m(xi+dx), m(yi+dy), m(zi+dz), s) * (dx?u:1-u) * (dy?v:1-v) * (dz?w:1-w); } return r;
+}
+function makeNoise() {
+  const data = new Uint8Array(NS*NS*NS*4); const cells = 8, cs = NS/cells; const pts = [];
+  for (let i = 0; i < cells**3; i++) pts.push([hash3(i,1,2,9), hash3(i,3,4,9), hash3(i,5,6,9)]);
+  for (let z = 0; z < NS; z++) for (let y = 0; y < NS; y++) for (let x = 0; x < NS; x++) {
+    let f = 0, a = 0.5, wsum = 0; for (const p of [4, 8, 16, 32]) { const sc = p/NS; f += a * vnoiseT(x*sc, y*sc, z*sc, p, p); wsum += a; a *= 0.5; } f /= wsum;
+    const cx = Math.floor(x/cs), cy = Math.floor(y/cs), cz = Math.floor(z/cs); let dm = 9;
+    for (let k = -1; k <= 1; k++) for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) {
+      const ax = cx+i, ay = cy+j, az = cz+k; const wx = (ax+cells)%cells, wy = (ay+cells)%cells, wz = (az+cells)%cells; const q = pts[wx + cells*(wy + cells*wz)];
+      const dx = (ax + q[0])*cs - x - 0.5, dy = (ay + q[1])*cs - y - 0.5, dz = (az + q[2])*cs - z - 0.5; dm = Math.min(dm, Math.sqrt(dx*dx + dy*dy + dz*dz)/cs);
+    }
+    const o = 4*(x + NS*(y + NS*z));
+    data[o] = Math.round(255*Math.min(1, Math.max(0, (f - 0.5)*1.6 + 0.5))); data[o+1] = Math.round(255*Math.max(0, 1 - dm));
+    data[o+2] = Math.round(255*vnoiseT(x/4, y/4, z/4, 16, 77)); data[o+3] = Math.round(255*vnoiseT(x/2, y/2, z/2, 32, 78));
+  }
+  return data;
+}
+const NOISE = makeNoise();
+function sampleR(px, py, pz) { // 与 GL LINEAR+REPEAT 一致的三线性采样（R 通道）
+  const x = px*NS - 0.5, y = py*NS - 0.5, z = pz*NS - 0.5; const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), fx = x - xi, fy = y - yi, fz = z - zi;
+  const m = a => ((a % NS) + NS) % NS; let r = 0;
+  for (let k = 0; k < 8; k++) { const dx = k & 1, dy = (k >> 1) & 1, dz = k >> 2; r += NOISE[4*(m(xi+dx) + NS*(m(yi+dy) + NS*m(zi+dz)))]/255 * (dx?fx:1-fx) * (dy?fy:1-fy) * (dz?fz:1-fz); }
+  return r;
+}
+/* ---------- 与着色器一致的地面高度（只为算眼高） ---------- */
+function stairProfile(f, qk, dq) { const q = qk + f*dq; const uT = 2*Math.cos(qk + 0.5*f*dq)*Math.sin(0.5*f*dq)/Math.max(Math.sin(q),1e-4); const uC = 2*Math.sin(q + 0.5*(1-f)*dq)*Math.sin(0.5*(1-f)*dq)/Math.max(Math.cos(q),1e-4); return R*Math.min(uT, uC); }
+function terrNoiseJS(nw) { const s = R/40; const q = nw.map(v => v*s); const a = sampleR(q[0],q[1],q[2]), b = sampleR(q[0]*4+0.37,q[1]*4+0.37,q[2]*4+0.37), c = sampleR(q[0]*16+0.71,q[1]*16+0.71,q[2]*16+0.71); return (a*0.6 + b*0.3 + c*0.1)*2 - 1; }
+/* ---------- three ---------- */
+const canvas = $('c');
+const renderer = new THREE.WebGLRenderer({canvas, antialias:false, powerPreference:'high-performance'});
+if (!renderer.capabilities.isWebGL2) $('err').textContent = '需要 WebGL2';
+renderer.autoClear = false;
+const gl = renderer.getContext();
+const dbg = gl.getExtension('WEBGL_debug_renderer_info'); const GPU = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : '?';
+const floatLinear = !!gl.getExtension('OES_texture_float_linear');
+const noiseTex = new THREE.DataTexture3D(NOISE, NS, NS, NS); noiseTex.format = THREE.RGBAFormat; noiseTex.type = THREE.UnsignedByteType;
+noiseTex.minFilter = noiseTex.magFilter = THREE.LinearFilter; noiseTex.wrapS = noiseTex.wrapT = noiseTex.wrapR = THREE.RepeatWrapping; noiseTex.unpackAlignment = 1; noiseTex.needsUpdate = true;
+const RT = (w, h, o) => new THREE.WebGLRenderTarget(w, h, Object.assign({type:THREE.HalfFloatType, format:THREE.RGBAFormat, minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, depthBuffer:false, stencilBuffer:false, generateMipmaps:false}, o||{}));
+const NEAREST = {minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter};
+const tauRT = RT(256, 128, floatLinear ? {type:THREE.FloatType} : {});
+const msRT = RT(32, 32);
+const probeRT = RT(32, 48, NEAREST);
+const shRT = [RT(9, 3, NEAREST), RT(9, 3, NEAREST)];
+const meterRT = RT(64, 32, NEAREST);
+const expRT = [RT(1, 1, NEAREST), RT(1, 1, NEAREST)];
+let farRT, nearRT, hdrRT, bloomA, bloomB;
+const U = {
+  uR:{value:R}, uA:{value:A_T}, uZtop:{value:320}, uBetaR:{value:new THREE.Vector3()}, uBetaMs:{value:new THREE.Vector3()}, uBetaMa:{value:new THREE.Vector3()},
+  uHR:{value:40}, uHM:{value:8}, uMieG:{value:0.76},
+  uTauLUT:{value:tauRT.texture}, uTauSize:{value:new THREE.Vector2(256,128)}, uMsLUT:{value:msRT.texture}, uMsSize:{value:new THREE.Vector2(32,32)},
+  uSH:{value:shRT[0].texture}, uExpTex:{value:expRT[0].texture}, uNoise3:{value:noiseTex},
+  uSunW:{value:new THREE.Vector3()}, uSunRho:{value:SKY.rhoS}, uSunE0:{value:new THREE.Vector3(SKY.E0, SKY.E0, SKY.E0)}, uSunD0:{value:SKY.D0},
+  uMoonW:{value:new THREE.Vector3()}, uMoonRho:{value:SKY.rhoM}, uMoonAlb:{value:0.12},
+  uCamW:{value:new THREE.Vector3()}, uCamK:{value:0}, uCamZ:{value:0}, uInvVP:{value:new THREE.Matrix4()}, uCM2W:{value:new THREE.Matrix3()},
+  uTime:{value:0}, uGroundAlb:{value:0.15}, uTowerAlb:{value:0.004},
+  uStairOn:{value:1}, uStairD:{value:0.001}, uTerrAmp:{value:0.25},
+  uCloudOn:{value:1}, uCloudB:{value:1.5}, uCloudT:{value:4.0}, uCloudSig:{value:30}, uCloudCov:{value:0.45},
+  uZuiyuN:{value:new THREE.Vector3()}, uZuiyuOvc:{value:1}, uAbyssHalf:{value:1.0},
+};
+const fsCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1); const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2)); const fsScene = new THREE.Scene(); fsScene.add(quad); quad.frustumCulled = false;
+function mat(fs, local, extra) { return new THREE.ShaderMaterial(Object.assign({glslVersion:THREE.GLSL3, uniforms:Object.assign({}, U, local||{}), vertexShader:PASSES.full, fragmentShader:fs, depthTest:false, depthWrite:false}, extra||{})); }
+function pass(m, target) { quad.material = m; renderer.setRenderTarget(target); renderer.render(fsScene, fsCam); }
+const M = {
+  tau: mat(PASSES.tau), ms: mat(PASSES.ms), probe: mat(PASSES.probe), sh: mat(PASSES.sh, {tProbe:{value:probeRT.texture}}),
+  far: mat(PASSES.far, {uMeshR:{value:12}, uHmax:{value:2}, uReliefN:{value:48}, uFarN:{value:8}}),
+  near: mat(PASSES.near, {tFar:{value:null}, uNearN:{value:16}, uCloudN:{value:16}, uJit:{value:0.5}}),
+  comp: mat(PASSES.composite, {tFar:{value:null}, tNear:{value:null}, uLowSize:{value:new THREE.Vector2()}, uPix:{value:new THREE.Vector2()}}),
+  meter: mat(PASSES.meter, {tHDR:{value:null}}),
+  adapt: mat(PASSES.adapt, {tMeter:{value:meterRT.texture}, tNear:{value:null}, uDt:{value:0.016}, uEvBias:{value:0}, uSunUV:{value:new THREE.Vector2()}, uSunEye:{value:0}}),
+  down: mat(PASSES.bloomDown, {tSrc:{value:null}, uTexel:{value:new THREE.Vector2()}}),
+  blur: mat(PASSES.blur, {tSrc:{value:null}, uDir:{value:new THREE.Vector2()}}),
+  tone: mat(PASSES.tonemap, {tHDR:{value:null}, tBloom:{value:null}, tExpNew:{value:null}, uBloom:{value:0.04}, uGlare:{value:0.6}, uSunDir:{value:new THREE.Vector3()}}),
+};
+const GRIDN = 192;
+const terrUni = {uPsiG:{value:0}, uRG:{value:1}, uCamOff:{value:new THREE.Vector3()}, uStairF0:{value:0}, uStairK0:{value:0}, uMeshR:{value:12}, uMeshD0:{value:0.004}, uLogFC:{value:1}, uG:{value:new THREE.Vector3()}};
+const terrMat = new THREE.ShaderMaterial({glslVersion:THREE.GLSL3, defines:{GRIDN}, uniforms:Object.assign({}, U, terrUni), vertexShader:PASSES.terrainV, fragmentShader:PASSES.terrainF});
+function gridGeo(n) { const pos = new Float32Array(n*n*3), idx = []; for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) { const o = 3*(i + n*j); pos[o] = i/(n-1)*2 - 1; pos[o+1] = j/(n-1)*2 - 1; pos[o+2] = 0; }
+  for (let j = 0; j < n-1; j++) for (let i = 0; i < n-1; i++) { const a = i + n*j, b = a + 1, c = a + n, d = c + 1; idx.push(a, b, d, a, d, c); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setIndex(idx); return g; }
+const terrain = new THREE.Mesh(gridGeo(GRIDN), terrMat); terrain.frustumCulled = false;
+const terrScene = new THREE.Scene(); terrScene.add(terrain);
+const cam = new THREE.PerspectiveCamera(60, 1, 0.0003, 40);
+/* ---------- 尺寸与画质 ---------- */
+const Q = [{scale:0.6, low:0.5, near:10, cloud:10, far:6, relief:24}, {scale:0.8, low:0.5, near:16, cloud:16, far:8, relief:48}, {scale:1.0, low:0.5, near:24, cloud:28, far:12, relief:80}];
+let W = 1, H = 1, LW = 1, LH = 1;
+function resize() {
+  const q = Q[S.q]; const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const cw = canvas.clientWidth, ch = canvas.clientHeight; renderer.setPixelRatio(1); renderer.setSize(Math.round(cw*dpr), Math.round(ch*dpr), false);
+  W = Math.max(16, Math.round(cw*dpr*q.scale)); H = Math.max(16, Math.round(ch*dpr*q.scale)); LW = Math.max(8, Math.round(W*q.low)); LH = Math.max(8, Math.round(H*q.low));
+  [farRT, nearRT, hdrRT, bloomA, bloomB].forEach(r => r && r.dispose());
+  farRT = RT(LW, LH, NEAREST); nearRT = RT(LW, LH); hdrRT = RT(W, H, {depthBuffer:true}); bloomA = RT(Math.ceil(W/4), Math.ceil(H/4)); bloomB = RT(Math.ceil(W/4), Math.ceil(H/4));
+  cam.aspect = cw/ch; cam.updateProjectionMatrix();
+  M.far.uniforms.uReliefN.value = q.relief; M.far.uniforms.uFarN.value = q.far; M.near.uniforms.uNearN.value = q.near; M.near.uniforms.uCloudN.value = q.cloud;
+}
+/* ---------- 参数 → 统一量 ---------- */
+let lutDirty = true;
+function atmoParams() {
+  const rho0 = 1, bR = [5.802e-3, 13.558e-3, 33.1e-3].map(v => v*rho0);
+  const ext = Math.max(3.912/S.V - bR[1], 5e-4);
+  U.uBetaR.value.set(...bR); U.uBetaMs.value.setScalar(ext*0.9); U.uBetaMa.value.setScalar(ext*0.1);
+  U.uHR.value = S.H; U.uHM.value = Math.max(1, S.H/5); U.uZtop.value = Math.min(8*S.H, 600);
+  lutDirty = true;
+}
+const st = {t:0, psiG:0, lat:0};
+function updateFrame(dtReal) {
+  const site = SITES[S.site]; const s0 = site[1], lon = site[2]*D2R;
+  const lat0 = Math.PI/2 - s0/R;
+  // 阶地：用户给的是本地阶面宽 w → 每级沿球面弧长 L = w / cos(lat)
+  const Lstep = S.W/Math.max(Math.cos(lat0), 0.05); const dq = Lstep/R; U.uStairD.value = dq; U.uStairOn.value = S.mode;
+  // 站位：阶地模式下站在阶面上（S.stand＝在阶面宽度里的位置，0 靠北崖脚，1 靠南崖沿），不站在崖面上
+  const s = S.mode ? (Math.floor(s0/Lstep) + S.stand*Math.cos(lat0)**2)*Lstep : s0;
+  const psiG = s/R; const lat = Math.PI/2 - psiG; st.psiG = psiG; st.lat = lat;
+  // 时间：t 以日计；当地太阳时 frac(t − λ/2π)
+  const t = S.year*SKY.Y + S.day + S.hour/24 + lon/TAU; st.t = t;
+  const x = s/Lstep; const k0 = Math.floor(x); terrUni.uStairF0.value = x - k0; terrUni.uStairK0.value = k0;
+  // 地面高度（与 GLSL 同式）
+  const g = 1.4*Math.sin(Math.min(psiG, Math.PI - psiG));
+  const nwG = [Math.sin(psiG)*Math.cos(lon), -Math.cos(psiG), Math.sin(psiG)*Math.sin(lon)];
+  let hG = U.uTerrAmp.value/Math.max(g,0.3)*terrNoiseJS(nwG)*(S.mode ? 0.35 : 1);
+  if (S.mode) hG += stairProfile(x - k0, k0*dq, dq) - 0.25*dq*R*Math.sin(2*lat);
+  const eye = 0.0017;
+  // CM 系：相机经度＝0
+  const G = [R*Math.sin(psiG), -R*Math.cos(psiG), 0], nG = [-Math.sin(psiG), Math.cos(psiG), 0], Ug = [-1, 0, 0];
+  const off = [nG[0]*hG + Ug[0]*eye, nG[1]*hG, 0];
+  const C = [G[0] + off[0], G[1] + off[1], 0];
+  const K = -2*R*hG - 2*R*Math.sin(psiG)*eye + off[0]*off[0] + off[1]*off[1];   // |C|²−R²（双精度、无相减）
+  const camR = Math.sqrt(R*R + K); U.uCamW.value.set(C[0], C[1], C[2]); U.uCamK.value = K; U.uCamZ.value = -K/(R + camR);
+  terrUni.uPsiG.value = psiG; terrUni.uRG.value = R*Math.sin(psiG); terrUni.uCamOff.value.set(off[0], off[1], off[2]); terrUni.uG.value.set(G[0], G[1], G[2]);
+  const cl = Math.cos(lon), sl = Math.sin(lon);
+  U.uCM2W.value.set(cl, 0, -sl, 0, 1, 0, sl, 0, cl);
+  const toCM = v => [v[0]*cl + v[2]*sl, v[1], -v[0]*sl + v[2]*cl];
+  const sw = toCM(sunAtW(t)), mw = toCM(moonAtW(t)); U.uSunW.value.set(...sw); U.uMoonW.value.set(...mw);
+  const zs = 6670/R, zl = -4*D2R; U.uZuiyuN.value.set(Math.sin(zs)*Math.cos(zl), -Math.cos(zs), Math.sin(zs)*Math.sin(zl)); U.uZuiyuOvc.value = S.zuiyu ? 1 : 0;
+  U.uCloudOn.value = S.clouds ? 1 : 0; U.uCloudCov.value = S.cov; U.uTime.value = t*86400/60;   // 云的“时间”以分钟计
+  // 相机朝向：yaw 自北向东，pitch 相对重力水平
+  const yw = S.yaw*D2R, pt = S.pitch*D2R; const N = [0,-1,0], E = [0,0,-1];
+  const f = [0,1,2].map(i => Math.cos(pt)*(Math.cos(yw)*N[i] + Math.sin(yw)*E[i]) + Math.sin(pt)*Ug[i]);
+  cam.position.set(0,0,0); cam.up.set(-1,0,0); cam.fov = S.fov; cam.updateProjectionMatrix(); cam.lookAt(f[0], f[1], f[2]); cam.updateMatrixWorld();
+  const vp = new THREE.Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse); U.uInvVP.value.copy(vp).invert();
+  terrUni.uLogFC.value = 2/Math.log2(cam.far + 1);
+  // 太阳在屏幕上的位置与到眼照度（未计大气，大气与云在 GPU 里乘）
+  const rel = [sw[0]-C[0], sw[1]-C[1], sw[2]-C[2]], dS = Math.hypot(...rel); const sd = rel.map(v => v/dS);
+  M.tone.uniforms.uSunDir.value.set(...sd);
+  const pv = new THREE.Vector3(...sd).applyMatrix4(vp); const front = new THREE.Vector3(...sd).dot(new THREE.Vector3(...f)) > 0;
+  M.adapt.uniforms.uSunUV.value.set(front ? pv.x*0.5 + 0.5 : -1, front ? pv.y*0.5 + 0.5 : -1);
+  const vis = diskVisibleJS(C, sw); st.sunVis = vis;
+  const Teye = Math.exp(-0.0196*S.H*0.6/Math.max(0.2, -(C[0]*sd[0] + C[1]*sd[1])/R));   // 粗估（眩光强度只需量级）
+  M.adapt.uniforms.uSunEye.value = SKY.E0*(SKY.D0/dS)**2*vis*Teye;
+  st.sunElev = Math.asin(-sd[0])/D2R; st.sunAz = ((Math.atan2(-sd[2], -sd[1])/D2R) + 360) % 360;
+  const mrel = [mw[0]-C[0], mw[1]-C[1], mw[2]-C[2]], dM = Math.hypot(...mrel); st.moonElev = Math.asin(-mrel[0]/dM)/D2R; st.moonAz = ((Math.atan2(-mrel[2], -mrel[1])/D2R) + 360) % 360;
+  st.moonLit = diskVisibleJS(mw, sw); st.moonDiam = 2*Math.atan(SKY.rhoM/dM)/D2R;
+  st.dirs = {sun:sd, moon:mrel.map(v => v/dM)};
+}
+function segBlocked(ax, az, bx, bz) { const dx = bx-ax, dz = bz-az, L2 = dx*dx + dz*dz; let u = L2 > 0 ? -(ax*dx + az*dz)/L2 : 0; u = Math.max(0, Math.min(1, u)); const cx = ax + u*dx, cz = az + u*dz; return cx*cx + cz*cz < A_T*A_T; }
+function diskVisibleJS(V, Q) { const dx = Q[0]-V[0], dz = Q[2]-V[2], L = Math.hypot(dx, dz), px = -dz/L, pz = dx/L; let s = 0, w = 0; for (let i = 0; i < 33; i++) { const u = -1 + (2*i+1)/33, ww = Math.sqrt(1 - u*u); w += ww; if (!segBlocked(V[0], V[2], Q[0] + u*SKY.rhoS*px, Q[2] + u*SKY.rhoS*pz)) s += ww; } return s/w; }
+/* ---------- 每帧渲染 ---------- */
+let ping = 0, last = performance.now(), fpsAcc = 0, fpsN = 0, fps = 0, firstFrame = true;
+function frame(now) {
+  const dt = Math.min(0.1, (now - last)/1000); last = now;
+  step(dt);
+  fpsAcc += dt; fpsN++; if (fpsAcc > 0.5) { fps = fpsN/fpsAcc; fpsAcc = 0; fpsN = 0; hud(); }
+  requestAnimationFrame(frame);
+}
+function step(dt) {
+  if (SPEEDS[S.spd] > 0) { S.hour += dt*SPEEDS[S.spd]/3600; while (S.hour >= 24) { S.hour -= 24; S.day = (S.day + 1) % 360; } syncUI(false); }
+  updateFrame(dt);
+  if (lutDirty) { pass(M.tau, tauRT); pass(M.ms, msRT); lutDirty = false; }
+  if (firstFrame) { for (const r of expRT) { renderer.setRenderTarget(r); renderer.setClearColor(new THREE.Color(0.05, 0, 0), 1); renderer.clear(); } for (const r of shRT) { renderer.setRenderTarget(r); renderer.setClearColor(0x000000, 1); renderer.clear(); } firstFrame = false; }
+  U.uExpTex.value = expRT[ping].texture;
+  // 探针 → 球谐（ping-pong，读上一帧的球谐）
+  U.uSH.value = shRT[ping].texture; pass(M.probe, probeRT);
+  M.sh.uniforms.uSH.value = null; pass(M.sh, shRT[1-ping]); U.uSH.value = shRT[1-ping].texture;
+  // 远场与近段（半分辨率）
+  pass(M.far, farRT);
+  M.near.uniforms.tFar.value = farRT.texture; M.near.uniforms.uJit.value = 0.5; pass(M.near, nearRT);
+  // 全分辨率：先天空合成，再地形
+  M.comp.uniforms.tFar.value = farRT.texture; M.comp.uniforms.tNear.value = nearRT.texture; M.comp.uniforms.uLowSize.value.set(LW, LH); M.comp.uniforms.uPix.value.set(1/W, 1/H);
+  pass(M.comp, hdrRT);
+  renderer.setRenderTarget(hdrRT); renderer.clearDepth(); renderer.render(terrScene, cam);
+  // 测光、适应
+  M.meter.uniforms.tHDR.value = hdrRT.texture; pass(M.meter, meterRT);
+  M.adapt.uniforms.tNear.value = nearRT.texture; M.adapt.uniforms.uDt.value = dt; M.adapt.uniforms.uEvBias.value = S.ev; pass(M.adapt, expRT[1-ping]);
+  // 泛光
+  M.down.uniforms.tSrc.value = hdrRT.texture; M.down.uniforms.uTexel.value.set(1/W, 1/H); pass(M.down, bloomA);
+  M.blur.uniforms.tSrc.value = bloomA.texture; M.blur.uniforms.uDir.value.set(1.5/bloomA.width, 0); pass(M.blur, bloomB);
+  M.blur.uniforms.tSrc.value = bloomB.texture; M.blur.uniforms.uDir.value.set(0, 1.5/bloomA.height); pass(M.blur, bloomA);
+  // 色调映射到屏幕
+  M.tone.uniforms.tHDR.value = hdrRT.texture; M.tone.uniforms.tBloom.value = bloomA.texture; M.tone.uniforms.tExpNew.value = expRT[1-ping].texture;
+  quad.material = M.tone; renderer.setRenderTarget(null); renderer.render(fsScene, fsCam);
+  ping = 1 - ping;
+}
+function hud() {
+  const lt = S.hour, hh = Math.floor(lt), mm = Math.floor((lt - hh)*60);
+  const sv = st.sunVis > 0.999 ? '昼' : st.sunVis < 0.001 ? '夜（塔影）' : '日缘入塔 ' + (st.sunVis*100).toFixed(0) + '%';
+  $('hud').textContent = `${SITES[S.site][0]}  纬度/地面倾角 ${(st.lat/D2R).toFixed(1)}°  ${(W)}×${H}（远场 ${LW}×${LH}）  ${fps.toFixed(0)} fps\n` +
+    `当地 ${String(hh).padStart(2,'0')}:${String(mm).padStart(2,'0')}  ${sv}  太阳 仰角 ${st.sunElev.toFixed(1)}° 方位 ${st.sunAz.toFixed(0)}°\n` +
+    `月 仰角 ${st.moonElev.toFixed(1)}° 方位 ${st.moonAz.toFixed(0)}° 视径 ${st.moonDiam.toFixed(2)}° ${st.moonLit < 0.01 ? '黑月' : '受照 ' + (st.moonLit*100).toFixed(0) + '%'}\n` +
+    `视线 方位 ${S.yaw.toFixed(0)}° 仰角 ${S.pitch.toFixed(0)}°  GPU ${GPU}`;
+}
+/* ---------- 交互 ---------- */
+SITES.forEach((s, i) => { const o = document.createElement('option'); o.value = i; o.textContent = s[0]; $('site').appendChild(o); });
+function syncUI(all) {
+  $('oDay').textContent = S.day + '（' + (S.day < 180 ? '冬半年' : '夏半年') + '）'; $('oHour').textContent = S.hour.toFixed(2) + ' 时'; $('oSpd').textContent = SPEEDS[S.spd] + '×';
+  $('oH').textContent = S.H + ' km'; $('oV').textContent = S.V + ' km'; $('oW').textContent = S.W.toFixed(1) + ' km'; $('oCov').textContent = S.cov.toFixed(2); $('oEv').textContent = S.ev.toFixed(2);
+  $('hour').value = S.hour; $('day').value = S.day;
+  if (all) { $('site').value = S.site; $('mode').value = S.mode; $('spd').value = S.spd; $('H').value = S.H; $('V').value = S.V; $('W').value = S.W; $('cov').value = S.cov; $('ev').value = S.ev; $('q').value = S.q; $('clouds').checked = S.clouds; $('zuiyu').checked = S.zuiyu; }
+}
+const bind = (id, key, fn, parse) => $(id).addEventListener('input', () => { S[key] = (parse || parseFloat)($(id).value); if (fn) fn(); syncUI(false); });
+bind('day', 'day'); bind('hour', 'hour'); bind('spd', 'spd'); bind('W', 'W'); bind('cov', 'cov'); bind('ev', 'ev');
+bind('H', 'H', atmoParams); bind('V', 'V', atmoParams);
+$('site').addEventListener('change', () => { S.site = +$('site').value; });
+$('mode').addEventListener('change', () => { S.mode = +$('mode').value; });
+$('q').addEventListener('change', () => { S.q = +$('q').value; resize(); });
+$('clouds').addEventListener('change', () => { S.clouds = $('clouds').checked; });
+$('zuiyu').addEventListener('change', () => { S.zuiyu = $('zuiyu').checked; });
+document.querySelectorAll('[data-look]').forEach(b => b.addEventListener('click', () => {
+  const k = b.dataset.look; const m = {N:[0,5], E:[90,5], S:[180,5], W:[270,5], Z:[S.yaw,89]};
+  if (m[k]) { S.yaw = m[k][0]; S.pitch = m[k][1]; return; }
+  const d = st.dirs[k]; S.pitch = Math.asin(-d[0])/D2R; S.yaw = ((Math.atan2(-d[2], -d[1])/D2R) + 360) % 360;
+}));
+let drag = null;
+canvas.addEventListener('pointerdown', e => { drag = {x:e.clientX, y:e.clientY}; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointermove', e => { if (!drag) return; const k = 0.15*S.fov/60; S.yaw = ((S.yaw - (e.clientX - drag.x)*k) % 360 + 360) % 360; S.pitch = Math.max(-89, Math.min(89, S.pitch + (e.clientY - drag.y)*k)); drag = {x:e.clientX, y:e.clientY}; });
+canvas.addEventListener('pointerup', () => drag = null);
+canvas.addEventListener('wheel', e => { e.preventDefault(); S.fov = Math.max(5, Math.min(100, S.fov*Math.exp(e.deltaY*0.001))); }, {passive:false});
+window.addEventListener('resize', resize);
+window.PROTO = {S, st, U, M, renderer, terrMat, setView(o) { Object.assign(S, o); syncUI(true); if ('q' in o) resize(); },
+  step(n, dt) { for (let i = 0; i < (n||1); i++) step(dt || 1/30); },
+  rt() { return {tauRT, msRT, probeRT, shRT, farRT, nearRT, hdrRT, expRT, meterRT, ping}; },
+  read(rt, x, y, w, h) { const g = renderer.getContext(); renderer.setRenderTarget(rt); const b = new Float32Array((w||1)*(h||1)*4); g.readPixels(x, y, w||1, h||1, g.RGBA, g.FLOAT, b); renderer.setRenderTarget(null); return Array.from(b); },
+  size() { return {W, H, LW, LH}; } };
+// 调试：view({...}) 同步渲染若干帧；px(x,y) 读 800×425 截图坐标处的 HDR 值
+window.view = function (o, n) { $('ui').style.display = 'none'; $('hud').style.display = 'none'; PROTO.setView(o); PROTO.step(n || 40, 1/10); return st; };
+window.px = function (x, y) { return PROTO.read(hdrRT, Math.round(x*W/800), Math.round((425 - y)*H/425)).map(v => +v.toPrecision(3)); };
+atmoParams(); resize(); syncUI(true); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+{
+  "title": "环域星体模型",
+  "cdn": [
+    "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js",
+    "https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"
+  ],
+  "fonts": "https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600&display=swap",
+  "scripts": [
+    {"src": "astro.js", "node": true},
+    {"src": "core/util.js", "node": true}, {"src": "core/world.js", "node": true},
+    {"src": "core/store.js", "node": true}, {"src": "core/calc.js", "node": true},
+    {"src": "core/model.js", "node": true},
+    {"glsl": "glsl"},
+    {"src": "gfx/gfx.js"},
+    {"src": "overview/geom.js", "node": true}, {"src": "overview/shell.js"}, {"src": "overview/bodies.js"},
+    {"src": "overview/labels.js"}, {"src": "overview/overview.js"},
+    {"src": "fp/uniforms.js", "node": true}, {"src": "fp/noise.js", "node": true}, {"src": "fp/ground.js", "node": true},
+    {"src": "fp/celestial.js", "node": true}, {"src": "fp/camera.js", "node": true}, {"src": "fp/settings.js", "node": true},
+    {"src": "fp/passes.js", "node": true}, {"src": "fp/eye.js", "node": true}, {"src": "fp/instances.js"}, {"src": "fp/controls.js"}, {"src": "fp/fp.js"},
+    {"src": "charts/base.js"}, {"src": "charts/sky.js"}, {"src": "charts/day.js"}, {"src": "charts/year.js"},
+    {"src": "charts/helix.js"}, {"src": "charts/meridian.js"}, {"src": "charts/month.js"},
+    {"src": "ui/widgets.js"}, {"src": "ui/params.js", "node": true}, {"src": "ui/layout.js"}, {"src": "ui/timebar.js"},
+    {"src": "ui/sitecard.js"}, {"src": "ui/readouts.js"}, {"src": "ui/calendar.js"}, {"src": "ui/notes.js"},
+    {"src": "ui/fphud.js"}, {"src": "ui/keys.js"},
+    {"src": "app.js"}
+  ],
+  "harness": ["../test/render_checks.js", "../test/render_ov.js", "../test/render_fp.js", "../test/render_ui.js", "../test/render_charts.js"]
+}

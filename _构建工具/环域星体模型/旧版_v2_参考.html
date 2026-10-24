@@ -1,0 +1,914 @@
+<title>环域星体模型</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@600&display=swap">
+<style>
+/* 布局：左侧是剖开半边的空心星体（三维），底部压一条时间轴；右侧仪表栏自上而下：观察点 → 一年 → 子午线 → 历法 → 月 → 星体 → 物理推论。只用一套暗色，像一间看星体的暗室。 */
+:root{
+  color-scheme: dark;
+  --bg:#0a0c11; --stage:#06070b; --panel:#0f1219; --raise:#171b25; --line:#242a37; --line2:#353d50;
+  --fg:#ddd6c4; --muted:#938f7f; --dim:#64635c;
+  --sun:#f1b65a; --sun-ink:#1d1406; --moon:#c3cddd;
+  --sky-day:#4b6189; --sky-night:#0c1121; --night:#86a3d0;
+  --winter:#7493bd; --summer:#dba84a;
+  --z-light:#aac3d7; --z-plain:#97a26e; --z-heavy:#b0603f; --z-limbo:#6a5788;
+  --f-display:"Noto Serif SC","Songti SC","STSong","SimSun",serif;
+  --f-body:"Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--f-body);font-size:14px;line-height:1.55;-webkit-font-smoothing:antialiased}
+.app{box-sizing:border-box;height:100%;display:grid;grid-template-columns:minmax(0,1fr) minmax(320px,410px);gap:14px;padding-block:12px;padding-inline:16px}
+.stage{position:relative;min-width:0;min-height:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--stage)}
+#gl{position:absolute;inset:0;width:100%;height:100%;display:block;touch-action:none}
+.labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.lbl{position:absolute;transform:translate(-50%,-140%);font-size:12px;white-space:nowrap;color:var(--fg);text-shadow:0 0 4px #000,0 0 2px #000;letter-spacing:.02em}
+.lbl.sun{color:var(--sun)} .lbl.moon{color:var(--moon)} .lbl.obs{color:#fff;font-weight:700} .lbl.pole{color:var(--muted)} .lbl.place{color:var(--muted);font-size:11px}
+.hud{position:absolute;top:12px;left:14px;right:14px;display:flex;justify-content:space-between;align-items:flex-start;gap:12px;pointer-events:none;flex-wrap:wrap}
+.hud > *{pointer-events:auto}
+.title h1{font-family:var(--f-display);font-weight:600;font-size:22px;letter-spacing:.14em;margin:0;line-height:1.2;text-wrap:balance}
+.title p{margin:3px 0 8px;color:var(--muted);font-size:12px;max-width:430px}
+.legend{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12px;color:var(--muted);max-width:430px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.legend i{width:10px;height:10px;border-radius:2px;display:inline-block;border:1px solid rgba(255,255,255,.12)}
+.views{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.btn{font:inherit;font-size:12px;color:var(--fg);background:rgba(20,24,34,.88);border:1px solid var(--line2);border-radius:6px;padding:4px 10px;cursor:pointer}
+.btn:hover{border-color:var(--sun)}
+.btn[aria-pressed="true"]{background:var(--sun);color:var(--sun-ink);border-color:var(--sun)}
+.btn:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--sun);outline-offset:2px}
+.timebar{position:absolute;left:12px;right:12px;bottom:12px;background:rgba(11,13,19,.9);border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:grid;gap:7px}
+.trow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.yr{display:inline-flex;align-items:center;gap:6px;font-size:13px}
+.yr .btn{padding:2px 8px}
+.when{font-family:var(--f-display);font-size:16px;letter-spacing:.05em}
+.when small{font-family:var(--f-body);font-size:12px;color:var(--muted);letter-spacing:0;margin-left:6px}
+.track{position:relative;padding-top:14px}
+.season-band{height:5px;border-radius:3px;margin-bottom:3px}
+.marks{position:absolute;left:0;right:0;top:0;height:14px}
+.mark{position:absolute;top:0;transform:translateX(-50%);font-size:10px;color:var(--muted);white-space:nowrap;line-height:12px}
+.mark.l{transform:none}
+.ticks{position:relative;height:14px;font-size:10px;color:var(--dim)}
+.ticks span{position:absolute;transform:translateX(-50%)}
+input[type=range]{width:100%;accent-color:var(--sun);margin:0}
+select{font:inherit;font-size:13px;color:var(--fg);background:var(--raise);border:1px solid var(--line2);border-radius:6px;padding:3px 6px}
+.panel{min-width:0;min-height:0;overflow-y:auto;display:flex;flex-direction:column;gap:12px;padding-right:2px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:grid;gap:10px}
+.card h2{font-family:var(--f-display);font-weight:600;font-size:15px;letter-spacing:.08em;margin:0;display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.card h2 small,.card h3 small{font-family:var(--f-body);font-weight:400;font-size:11px;color:var(--muted);letter-spacing:0}
+.card h3{font-family:var(--f-display);font-weight:600;font-size:13px;letter-spacing:.06em;margin:0;display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap}
+.lead{margin:0;font-size:12.5px;color:var(--fg);max-width:65ch}
+.ctls{display:grid;gap:9px}
+.ctl{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;align-items:baseline;font-size:12.5px}
+.ctl label{color:var(--muted)}
+.ctl output,.mono{font-family:var(--f-mono);font-size:12px;font-variant-numeric:tabular-nums}
+.ctl input[type=range]{grid-column:1/-1}
+.kv{display:grid;grid-template-columns:auto minmax(0,1fr);gap:5px 12px;font-size:12.5px;margin:0}
+.kv dt{color:var(--muted);white-space:nowrap}
+.kv dd{margin:0;font-variant-numeric:tabular-nums;min-width:0}
+.chip{display:inline-block;padding:0 7px;border-radius:9px;font-size:11.5px;line-height:18px;border:1px solid var(--line2);margin-right:4px}
+.chip.day{background:var(--sun);color:var(--sun-ink);border-color:var(--sun)}
+.chip.night{background:#1b2440;color:var(--night);border-color:#2f3d66}
+.chip.w{background:#1d2a40;color:#a9c0e0;border-color:#34507a}
+.chip.s{background:#3a2c12;color:#f0c879;border-color:#6e5420}
+.zchip{display:inline-flex;align-items:center;gap:6px}
+.zchip i{width:9px;height:9px;border-radius:2px;display:inline-block}
+canvas.chart{width:100%;display:block}
+#year{height:180px} #merid{height:200px} #moonStrip{height:62px}
+.sky-wrap{display:grid;justify-items:center;gap:4px}
+#sky{width:100%;max-width:300px;aspect-ratio:1;display:block}
+.cap{font-size:11.5px;color:var(--muted);margin:0}
+.slegend{display:flex;gap:10px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
+.slegend span{display:inline-flex;align-items:center;gap:4px}
+.slegend i{width:12px;height:4px;border-radius:2px;display:inline-block}
+.notes{margin:0;padding-left:20px;display:grid;gap:8px;font-size:12.5px}
+.notes b{color:var(--sun);font-weight:500}
+.check{display:flex;gap:8px;align-items:center;font-size:12.5px;color:var(--muted)}
+.foot{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;font-size:11.5px;color:var(--dim)}
+.err{position:absolute;inset:0;display:grid;place-items:center;color:var(--muted);font-size:13px;padding:24px;text-align:center}
+.hud-right{display:grid;gap:8px;justify-items:end}
+.fpbar{width:min(310px,100%);box-sizing:border-box;background:rgba(11,13,19,.9);border:1px solid var(--line);border-radius:8px;padding:10px 12px;display:grid;gap:8px}
+.fpbar .looks{display:flex;gap:6px;flex-wrap:wrap}
+.cross{position:absolute;width:16px;height:16px;margin:-8px 0 0 -8px;pointer-events:none;opacity:.55}
+.cross::before,.cross::after{content:"";position:absolute;background:var(--fg)}
+.cross::before{left:7px;top:0;width:2px;height:16px}
+.cross::after{top:7px;left:0;height:2px;width:16px}
+.lbl.compass{color:var(--sun);font-weight:700;transform:translate(-50%,-50%)}
+.stage.fp .title p,.stage.fp .legend{display:none}
+.fpbar details{font-size:11.5px;color:var(--muted)}
+.fpbar summary{cursor:pointer;color:var(--fg)}
+@media (max-width:900px){
+  .app{height:auto;display:flex;flex-direction:column}
+  .stage{height:70vh;min-height:420px}
+  .panel{overflow:visible;padding-right:0}
+}
+@media (max-width:520px){
+  .title h1{font-size:18px}
+  .legend,.title p{display:none}
+  .timebar{left:8px;right:8px;bottom:8px;padding:8px}
+  .when{font-size:14px}
+}
+</style>
+
+<div class="app">
+  <section class="stage" id="stage" aria-label="星体剖视图">
+    <canvas id="gl"></canvas>
+    <div class="labels" id="labels"></div>
+    <div class="hud">
+      <div class="title">
+        <h1>环域星体模型</h1>
+        <p>太阳贴着塔身绕行，一圈一日；同时沿塔身螺旋上下，一个来回一年。拖动旋转，滚轮缩放。</p>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="hud-right">
+        <div class="views" role="group" aria-label="视角">
+          <button class="btn" type="button" data-view="fp" aria-pressed="false">站在观察点</button>
+          <button class="btn" type="button" data-view="oblique" aria-pressed="true">斜看</button>
+          <button class="btn" type="button" data-view="top" aria-pressed="false">从塔顶看帝国</button>
+          <button class="btn" type="button" data-view="side" aria-pressed="false">侧看</button>
+          <button class="btn" type="button" data-view="bottom" aria-pressed="false">看另一端</button>
+          <button class="btn" type="button" id="clipBtn" aria-pressed="true">剖开近侧</button>
+        </div>
+        <div class="fpbar" id="fpbar" hidden>
+          <div class="looks" role="group" aria-label="朝向">
+            <button class="btn" type="button" data-look="N">朝北·塔根</button>
+            <button class="btn" type="button" data-look="E">朝东</button>
+            <button class="btn" type="button" data-look="S">朝南·塔顶</button>
+            <button class="btn" type="button" data-look="W">朝西</button>
+            <button class="btn" type="button" data-look="Z">仰望天顶</button>
+            <button class="btn" type="button" data-look="sun">看太阳</button>
+          </div>
+          <label class="check"><input type="checkbox" id="fpAtmo"> 有大气</label>
+          <div class="ctl"><label for="fpV">近地能见度</label><output id="oFpV"></output><input type="range" id="fpV" min="0" max="100" step="1"></div>
+          <div class="ctl"><label for="fpH">大气厚度（空气稀到三分之一的高度）</label><output id="oFpH"></output><input type="range" id="fpH" min="0" max="100" step="1"></div>
+          <p class="cap" id="fpRead"></p>
+          <details><summary>怎么看</summary><p class="cap">拖动转头，滚轮缩放。脚下画成一块水平的阶地。大气越贴地越浓：抬头看穿过的空气少，顺着地平线看穿过的多，所以巨塔的两头会先隐没。对面的空气在白昼里会发亮，在塔影里是暗的。关掉大气，就是真空里的样子。</p></details>
+        </div>
+      </div>
+    </div>
+    <div class="cross" id="cross" hidden></div>
+    <div class="timebar">
+      <div class="trow">
+        <button class="btn" type="button" id="play" aria-pressed="false">播放</button>
+        <select id="speed" aria-label="播放速度">
+          <option value="0.0833">每秒一个时辰</option>
+          <option value="1">每秒一日</option>
+          <option value="10">每秒十日</option>
+          <option value="32">每秒一月</option>
+        </select>
+        <span class="yr"><button class="btn" type="button" id="yPrev" aria-label="上一年">−</button><span id="yLabel" class="mono"></span><button class="btn" type="button" id="yNext" aria-label="下一年">＋</button></span>
+        <div class="when" id="when"></div>
+      </div>
+      <div class="track">
+        <div class="marks" id="marks"></div>
+        <div class="season-band" id="sband"></div>
+        <input type="range" id="tDay" min="0" max="359" step="1" aria-label="入冬后第几日">
+        <div class="ticks" id="ticks"></div>
+      </div>
+      <div class="ctl"><label for="tHour">标准时（方位 0° 那条子午线）</label><output id="oHour"></output><input type="range" id="tHour" min="0" max="24" step="0.05"></div>
+    </div>
+  </section>
+
+  <aside class="panel">
+    <section class="card" aria-labelledby="h-obs">
+      <h2 id="h-obs">观察点 <small id="obsNote"></small></h2>
+      <select id="preset" aria-label="选择地点"></select>
+      <div class="ctls">
+        <div class="ctl"><label for="obsDist">离塔根（沿地面）</label><output id="oObsDist"></output><input type="range" id="obsDist" min="0" max="20015" step="10"></div>
+        <div class="ctl"><label for="obsAz">方位（绕塔一周 360°）</label><output id="oObsAz"></output><input type="range" id="obsAz" min="-180" max="180" step="1"></div>
+      </div>
+      <dl class="kv" id="obsKV"></dl>
+      <div class="sky-wrap">
+        <canvas id="sky"></canvas>
+        <p class="cap">从这里仰望：上北（塔根）下南（塔顶），东在左。黑带是巨塔，金点是太阳今天走过的位置，虚圈表示它此刻在塔身背后。</p>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="h-year">
+      <h2 id="h-year">这里的一年 <small>金线：正午太阳高度　蓝线：全日日照</small></h2>
+      <canvas class="chart" id="year"></canvas>
+      <div class="slegend" id="slegend"></div>
+      <h3>这个月每夜子时的月亮 <small id="moonNote"></small></h3>
+      <canvas class="chart" id="moonStrip"></canvas>
+    </section>
+
+    <section class="card" aria-labelledby="h-mer">
+      <h2 id="h-mer">子午线剖面 <small>今天，从塔根一路到塔顶</small></h2>
+      <canvas class="chart" id="merid"></canvas>
+      <p class="cap">横轴是沿地面离塔根的距离（公里）。蓝线是夜长，一年到头不变；金线是今天的全日日照；底色是所属的域。</p>
+    </section>
+
+    <section class="card" aria-labelledby="h-cal">
+      <h2 id="h-cal">太阳与历法</h2>
+      <p class="lead">太阳离塔面的距离固定，所以各地昼夜长短一年到头不变。季节只看太阳在塔腰以上还是以下：在塔腰以上，塔根半球是冬；在塔腰以下是夏。太阳往上越过塔腰的那天，就是入冬。</p>
+      <div class="ctls" id="ctl-cal"></div>
+      <dl class="kv" id="calKV"></dl>
+    </section>
+
+    <section class="card" aria-labelledby="h-moon">
+      <h2 id="h-moon">月</h2>
+      <p class="lead">月亮自己不发光，在塔腰的高度绕塔，比太阳略慢，每过一个月被太阳追上一回。它转到塔的背面、落进塔影的那几夜，就是黑月。</p>
+      <label class="check"><input type="checkbox" id="moonOn"> 显示月亮</label>
+      <div class="ctls" id="ctl-moon"></div>
+      <dl class="kv" id="moonKV"></dl>
+    </section>
+
+    <section class="card" aria-labelledby="h-body">
+      <h2 id="h-body">星体与重力</h2>
+      <div class="ctls" id="ctl-body"></div>
+      <dl class="kv" id="bodyKV"></dl>
+    </section>
+
+    <section class="card" aria-labelledby="h-phys">
+      <h2 id="h-phys">按这套物理会推出什么</h2>
+      <ol class="notes">
+        <li><b>只有两季。</b>太阳在塔腰以上时，塔根半球是冬，塔顶半球是夏；越过塔腰就反过来。冬夏的长短由太阳在上下两截各待多久决定，现在是冬 <span class="mono" id="nW"></span>、夏 <span class="mono" id="nS"></span>。</li>
+        <li><b>昼夜不随季节变。</b>夜就是塔影，塔影宽窄只看太阳离塔多远，和它的高低无关。离塔越近的地方夜越长，观察点这里常年昼 <span class="mono" id="nDay"></span>、夜 <span class="mono" id="nNight"></span>。</li>
+        <li><b>黑月和黑夜同出一源。</b>月亮落进的是同一道塔影，所以一个月里黑月占的比例，大致等于一天里黑夜占的比例。夜长，黑月就长。</li>
+        <li><b>太阳不落山。</b>它一直在地平线以上。天黑是因为它滑到了塔身背后：黎明是它从塔的东缘露出来，黄昏是它没进西缘。太阳比你高时挂在南天，比你低时挂在北天。</li>
+        <li><b>重力方向。</b>自转重力垂直于塔轴、背离塔轴。地面要是顺着球面，离赤道越远越斜，观察点这里斜 <span class="mono" id="nSlope"></span>。能住人的只能是一圈圈平的阶地，峭壁朝着巨塔，往塔走就是往上爬。</li>
+        <li><b>往外就是往下。</b>水和冷空气都往赤道流，赤道一圈是全世界最低处，可以安放深渊。入冬前塔根一带先冷下来，冷空气顺坡往外刮，可以解释成余息。</li>
+        <li><b>没有星星。</b>从内壁往上看，视线最后都落在对面的内壁上。想看星空，只能到外表面去。</li>
+        <li><b>空气留不住。</b>纯按物理，空气会沉到赤道：从赤道往塔走 <span class="mono" id="nH"></span>，气压就掉到三分之一出头。观察点比赤道高 <span class="mono" id="nHigh"></span>，气压只剩赤道的 <span class="mono" id="nAir"></span>。这一条需要设定来兜住，比如黑塔的静滞把空气按在原地。</li>
+        <li><b>自转很快。</b>要在赤道产生 <span class="mono" id="nG"></span> 的重力，星体每 <span class="mono" id="nSpin"></span> 就得转一圈。太阳几乎跟着星体一起转，只比它快一点，地上的一日才是 <span class="mono" id="nT"></span>。</li>
+        <li><b>可选：庆典与黑月。</b>一年不是月的整数倍，所以入冬那夜的月相每年在变。按现在的参数，入冬之夜逢黑月是 <span id="nFest"></span>。要是把这定为圣皇庆典，“为什么偏偏是四年”就有了来由。</li>
+      </ol>
+    </section>
+
+    <div class="foot"><span>参数改动会记在这台设备的浏览器里。</span><button class="btn" type="button" id="reset">恢复默认</button></div>
+  </aside>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+'use strict';
+const $=id=>document.getElementById(id);
+const D2R=Math.PI/180, TAU=Math.PI*2, U=1/1000; // 三维里 1 个单位 = 1000 公里
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C={sun:css('--sun'),moon:css('--moon'),fg:css('--fg'),muted:css('--muted'),dim:css('--dim'),line:css('--line'),line2:css('--line2'),skyDay:css('--sky-day'),skyNight:css('--sky-night'),night:css('--night'),winter:css('--winter'),summer:css('--summer'),light:css('--z-light'),plain:css('--z-plain'),heavy:css('--z-heavy'),limbo:css('--z-limbo')};
+const ZCOL={light:C.light,plain:C.plain,heavy:C.heavy,limbo:C.limbo,tower:'#000000'};
+const ZNAME={tower:'塔基',light:'轻域',plain:'平域',heavy:'重域',limbo:'灵薄（赤道带）'};
+const FONT='11px "Noto Sans SC","PingFang SC","Microsoft YaHei",sans-serif';
+const FMONO='10px "IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace';
+
+const DEF={R:6371,a:600,gEq:1.4,gLight:0.75,gHeavy:1.2,limboLat:3,T:24,gap:40,hAmp:0.7,winterFrac:0.5,Y:360,moonOn:true,moonDist:3000,M:32};
+const SDEF={year:3,day:295,hour:15.75,speed:1,obsDist:6670,obsAz:-4,preset:3,clip:true,view:'oblique',fp:{yaw:180,pitch:28,fov:72,atmo:true,V:200,H:40}};
+const JUDGE_BEFORE=65; // 按正文日程推算：审判日约在入冬前六十五日
+const PRESETS=[
+  {name:'圣禁城',short:'圣禁城',dist:3600,az:0,note:'位置暂定'},
+  {name:'伊美忒',short:'伊美忒',dist:4000,az:2,note:'位置暂定'},
+  {name:'涅赫莱恩',short:'涅赫莱恩',dist:5600,az:25,note:'位置暂定'},
+  {name:'罪域·啜泣堡',short:'罪域',dist:6670,az:-4,note:'离塔约六分之一周长，取自《对巨塔的观测》'},
+  {name:'赤道·深渊',short:'赤道',frac:0.5,az:0,note:'自转重力最大处'},
+  {name:'世界另一端',short:'另一端',frac:0.72,az:180,note:'塔顶半球，冬夏与帝国相反'}
+];
+
+let P=Object.assign({},DEF), S=Object.assign({},SDEF);
+try{const raw=localStorage.getItem('huanyu-xingti-v2'); if(raw){const sv=JSON.parse(raw); if(sv&&sv.P)Object.assign(P,sv.P); if(sv&&sv.S)Object.assign(S,sv.S);}}catch(e){}
+S.playing=false;
+S.fp=Object.assign({},SDEF.fp,S.fp||{});
+let saveTimer=0;
+function save(){clearTimeout(saveTimer);saveTimer=setTimeout(()=>{try{localStorage.setItem('huanyu-xingti-v2',JSON.stringify({P,S:{year:S.year,day:S.day,hour:S.hour,speed:S.speed,obsDist:S.obsDist,obsAz:S.obsAz,preset:S.preset,clip:S.clip,view:S.view,fp:S.fp}}));}catch(e){}},300);}
+function presetDist(p){return p.frac!=null?p.frac*Math.PI*P.R:p.dist;}
+
+/* ---------- 计时 ---------- */
+const CN=['','一','二','三','四','五','六','七','八','九','十'];
+function cnNum(n){if(n<=10)return CN[n];if(n<20)return '十'+CN[n-10];return String(n);}
+const ZHI='子丑寅卯辰巳午未申酉戌亥';
+function shichen(fr){const x=((fr*24+1)%24+24)%24;const i=Math.floor(x/2);const ke=Math.floor((x-2*i)/2*8);return ZHI[i]+'时'+(ke===0?'初':cnNum(ke)+'刻');}
+function hhmm(fr){let m=Math.round((((fr%1)+1)%1)*1440)%1440;return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');}
+
+/* ---------- 物理 ---------- */
+// 太阳：离塔面距离固定；高度沿塔身正弦往返。u 是入冬后的日数；u=0 时太阳正往上越过塔腰。
+function cShift(){return Math.sin(Math.PI*(P.winterFrac-0.5));}
+function sunHeight(u){const c=cShift();const th=TAU*u/P.Y-Math.asin(c);return Math.max(-0.97,Math.min(0.97,P.hAmp*(Math.sin(th)+c)));}
+function hRange(){const c=cShift();return [Math.max(-0.97,P.hAmp*(c-1)),Math.min(0.97,P.hAmp*(c+1))];}
+function winterDays(){return P.winterFrac*P.Y;}
+function yearDay(t){return ((t%P.Y)+P.Y)%P.Y;}
+// 太阳比星体转得略快，相对地面朝自转方向绕塔，一日一圈；站在内壁上面朝塔根（北），自转方向在左手，所以它东升西落
+function sunAt(t){const h=sunHeight(yearDay(t));const d=P.a+P.gap;const f=t-Math.floor(t);const th=TAU*(f-0.5);return {x:d*Math.cos(th),y:h*P.R,z:d*Math.sin(th),d,h,th};}
+// 月：在塔腰高度绕塔，比太阳慢，每 M 日被追上一次；t=0 时正好在太阳对面（黑月正中）
+function moonAt(t,sun){const th=sun.th+Math.PI-TAU*t/P.M;return {x:P.moonDist*Math.cos(th),y:0,z:P.moonDist*Math.sin(th),th};}
+function blocked(ax,az,bx,bz){
+  const dx=bx-ax,dz=bz-az,L2=dx*dx+dz*dz;
+  let t=L2>1e-9?-(ax*dx+az*dz)/L2:0; if(t<0)t=0; else if(t>1)t=1;
+  const cx=ax+t*dx,cz=az+t*dz; return cx*cx+cz*cz<P.a*P.a;
+}
+function isBlack(t){const s=sunAt(t),m=moonAt(t,s);return blocked(s.x,s.z,m.x,m.z);}
+function season(t,o){const h=sunHeight(yearDay(t));const upper=h>0;const rootHemi=!o||o.y<=0;return (upper===rootHemi)?'冬':'夏';}
+function place(dist,azDeg){const psi=Math.max(0,Math.min(Math.PI,dist/P.R));const r=P.R*Math.sin(psi);const ph=azDeg*D2R;return {x:r*Math.cos(ph),y:-P.R*Math.cos(psi),z:r*Math.sin(ph),r,psi,ph,dist};}
+function zoneOfPsi(psi){const r=P.R*Math.sin(psi);if(r<=P.a)return 'tower';const lat=Math.abs(90-psi/D2R);if(lat<P.limboLat)return 'limbo';const g=P.gEq*Math.sin(psi);if(g<P.gLight)return 'light';if(g<P.gHeavy)return 'plain';return 'heavy';}
+function see(o,b){
+  const vx=b.x-o.x,vy=b.y-o.y,vz=b.z-o.z;const dist=Math.hypot(vx,vy,vz);
+  const rr=Math.max(o.r,1e-6);const sinE=(-o.x*vx-o.z*vz)/(rr*dist);
+  const hidden=o.r<=P.a||blocked(o.x,o.z,b.x,b.z);
+  return {vx,vy,vz,dist,sinE,hidden};
+}
+function irr(s){return s.hidden?0:Math.max(0,s.sinE)*(P.R*P.R)/(s.dist*s.dist);}
+function dayStats(o,t0,n){
+  let lit=0,dose=0,maxS=-1;
+  for(let k=0;k<n;k++){const sun=sunAt(t0+(k+0.5)/n);const s=see(o,sun);if(!s.hidden){lit++;dose+=irr(s);if(s.sinE>maxS)maxS=s.sinE;}}
+  return {dayLen:lit/n*P.T,nightLen:(n-lit)/n*P.T,dose:dose/n,noonEl:maxS>-1?Math.asin(Math.max(-1,Math.min(1,maxS)))/D2R:0};
+}
+// 当地坐标：上＝指向塔轴；北＝朝塔根；东＝面朝北时的右手边
+function frame(o){const c=Math.cos(o.ph),s=Math.sin(o.ph);return {U:[-c,0,-s],N:[0,-1,0],E:[s,0,-c]};}
+function localFrac(o,t){const f=t-Math.floor(t);return ((f-o.ph/TAU)%1+1)%1;}
+function phaseFrac(o,sun,m){
+  const ax=sun.x-m.x,ay=sun.y-m.y,az=sun.z-m.z,bx=o.x-m.x,by=o.y-m.y,bz=o.z-m.z;
+  return (1+(ax*bx+ay*by+az*bz)/(Math.hypot(ax,ay,az)*Math.hypot(bx,by,bz)))/2;
+}
+function dirName(az){let d=((az/D2R)%360+360)%360;if(d<1||d>359)return '正北';if(Math.abs(d-180)<1)return '正南';if(Math.abs(d-90)<1)return '正东';if(Math.abs(d-270)<1)return '正西';if(d<90)return '北偏东 '+d.toFixed(0)+'°';if(d<180)return '南偏东 '+(180-d).toFixed(0)+'°';if(d<270)return '南偏西 '+(d-180).toFixed(0)+'°';return '北偏西 '+(360-d).toFixed(0)+'°';}
+function fmtKm(v){return Math.round(v).toLocaleString('zh-CN')+' 公里';}
+function tNow(){return S.year*P.Y+S.day+S.hour/P.T;}
+function OBS(){return place(S.obsDist,S.obsAz);}
+function obsName(){return S.preset>=0?PRESETS[S.preset].name:'自定义地点';}
+function seasonDayText(day,o){
+  const W=winterDays();const rootHemi=!o||o.y<=0;
+  if(day<W)return (rootHemi?'冬':'夏')+'第 '+(Math.floor(day)+1)+' 日';
+  return (rootHemi?'夏':'冬')+'第 '+(Math.floor(day-W)+1)+' 日';
+}
+function blackFraction(){let b=0;const n=400;for(let i=0;i<n;i++){if(isBlack(i/n*P.M+0.37))b++;}return b/n;}
+function festivalInfo(){
+  const ks=[];for(let k=0;k<48;k++)if(isBlack(k*P.Y))ks.push(k);
+  if(ks.length<=1)return {text:'四十八年里只有第 1 年',ks,period:0};
+  const p=ks[1]-ks[0];let periodic=true;for(let i=1;i<ks.length;i++)if(ks[i]-ks[i-1]!==p){periodic=false;break;}
+  return {text:periodic?('每 '+p+' 年一回'):('第 '+ks.slice(0,6).map(k=>k+1).join('、')+'…年'),ks,period:periodic?p:0};
+}
+function isFestival(k){return isBlack(k*P.Y);}
+
+let REF_I=1,REF_DOSE=1,FEST=null;
+function updateRefs(){
+  const eq=place(Math.PI*P.R/2,0); // 基准：入冬那天（太阳正过塔腰）的赤道
+  REF_I=irr(see(eq,sunAt(0.5)))||1;
+  REF_DOSE=dayStats(eq,0,96).dose||1;
+  FEST=festivalInfo();
+}
+
+/* ---------- 颜色小工具 ---------- */
+function hexRgb(h){h=h.replace('#','');if(h.length===3)h=h.split('').map(c=>c+c).join('');const n=parseInt(h,16);return [(n>>16)&255,(n>>8)&255,n&255];}
+function mixHex(a,b,t){const A=hexRgb(a),B=hexRgb(b);return 'rgb('+A.map((v,i)=>Math.round(v+(B[i]-v)*t)).join(',')+')';}
+function rgba(h,al){const A=hexRgb(h);return 'rgba('+A[0]+','+A[1]+','+A[2]+','+al+')';}
+
+/* ---------- 画布 ---------- */
+function prep(cv){
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  const w=Math.max(10,cv.clientWidth||300),h=Math.max(10,cv.clientHeight||150);
+  if(cv.width!==Math.round(w*dpr)||cv.height!==Math.round(h*dpr)){cv.width=Math.round(w*dpr);cv.height=Math.round(h*dpr);}
+  const ctx=cv.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,w,h);return {ctx,w,h};
+}
+function drawMoonDisc(ctx,cx,cy,r,frac,litRight,dim){
+  ctx.save();ctx.globalAlpha=dim?0.38:1;
+  ctx.fillStyle='#1b2030';ctx.beginPath();ctx.arc(cx,cy,r,0,TAU);ctx.fill();
+  if(frac>0.01){
+    ctx.fillStyle=C.moon;ctx.beginPath();
+    ctx.arc(cx,cy,r,-Math.PI/2,Math.PI/2,!litRight);
+    const ex=Math.max(0.01,Math.abs(1-2*frac)*r);
+    ctx.ellipse(cx,cy,ex,r,0,Math.PI/2,-Math.PI/2,litRight?(frac<0.5):(frac>=0.5));
+    ctx.fill();
+  }
+  ctx.strokeStyle=C.line2;ctx.lineWidth=1;ctx.beginPath();ctx.arc(cx,cy,r,0,TAU);ctx.stroke();
+  ctx.restore();
+}
+
+/* ---------- 仰望天空 ---------- */
+function drawSky(){
+  const {ctx,w,h}=prep($('sky'));const cx=w/2,cy=h/2,Rp=Math.min(w,h)/2-18;
+  const o=OBS();const t=tNow();const sun=sunAt(t);
+  ctx.font=FONT;
+  if(o.r<=P.a){ctx.fillStyle=C.muted;ctx.textAlign='center';ctx.fillText('观察点落在塔基里',cx,cy);return;}
+  const F=frame(o);const ss=see(o,sun);
+  const proj=(vx,vy,vz)=>{const L=Math.hypot(vx,vy,vz);const ux=vx/L,uy=vy/L,uz=vz/L;const e=Math.asin(Math.max(-1,Math.min(1,ux*F.U[0]+uz*F.U[2])));if(e<-0.002)return null;const az=Math.atan2(ux*F.E[0]+uz*F.E[2],-uy);const rho=(Math.PI/2-e)/(Math.PI/2)*Rp;return {x:cx-rho*Math.sin(az),y:cy-rho*Math.cos(az),e,az,L};};
+  const k=ss.hidden?0:Math.min(1,Math.sqrt(irr(ss)/REF_I));
+  ctx.fillStyle=ss.hidden?C.skyNight:mixHex(C.skyNight,C.skyDay,0.25+0.75*k);
+  ctx.beginPath();ctx.arc(cx,cy,Rp,0,TAU);ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.10)';ctx.lineWidth=1;
+  [30,60].forEach(e=>{ctx.beginPath();ctx.arc(cx,cy,(90-e)/90*Rp,0,TAU);ctx.stroke();});
+  ctx.strokeStyle=C.line2;ctx.beginPath();ctx.arc(cx,cy,Rp,0,TAU);ctx.stroke();
+  // 巨塔
+  ctx.lineCap='round';ctx.strokeStyle='#000';let prev=null;const NB=200;
+  for(let i=0;i<=NB;i++){const y=-P.R+2*P.R*i/NB;const p=proj(-o.x,y-o.y,-o.z);if(!p){prev=null;continue;}const wpx=Math.max(1.5,2*Math.atan(P.a/p.L)/(Math.PI/2)*Rp);if(prev){ctx.lineWidth=(wpx+prev.w)/2;ctx.beginPath();ctx.moveTo(prev.x,prev.y);ctx.lineTo(p.x,p.y);ctx.stroke();}prev={x:p.x,y:p.y,w:wpx};}
+  // 塔腰
+  const pw=proj(-o.x,-o.y,-o.z);if(pw){ctx.strokeStyle=rgba(C.moon,0.5);ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(pw.x-10,pw.y);ctx.lineTo(pw.x+10,pw.y);ctx.stroke();ctx.fillStyle=C.dim;ctx.textAlign='left';ctx.fillText('塔腰',pw.x+12,pw.y+4);}
+  // 太阳今天的轨迹
+  const d0=Math.floor(t);
+  for(let i=0;i<144;i++){const s2=sunAt(d0+i/144);const v=see(o,s2);const p=proj(v.vx,v.vy,v.vz);if(!p)continue;ctx.fillStyle=v.hidden?rgba(C.sun,0.16):rgba(C.sun,0.8);ctx.fillRect(p.x-1,p.y-1,2,2);}
+  // 月亮
+  if(P.moonOn){
+    const m=moonAt(t,sun);const sm=see(o,m);const pm=proj(sm.vx,sm.vy,sm.vz);
+    if(pm){const black=blocked(sun.x,sun.z,m.x,m.z);const fr=black?0:phaseFrac(o,sun,m);const psun=proj(ss.vx,ss.vy,ss.vz);
+      ctx.save();ctx.translate(pm.x,pm.y);if(psun)ctx.rotate(Math.atan2(psun.y-pm.y,psun.x-pm.x));drawMoonDisc(ctx,0,0,7,fr,true,sm.hidden);ctx.restore();
+      ctx.fillStyle=C.moon;ctx.textAlign='left';ctx.fillText(black?'黑月':sm.hidden?'月（塔后）':'月',pm.x+10,pm.y+4);}
+  }
+  // 太阳
+  const ps=proj(ss.vx,ss.vy,ss.vz);
+  if(ps){
+    if(ss.hidden){ctx.setLineDash([2,2]);ctx.strokeStyle=C.sun;ctx.lineWidth=1.2;ctx.beginPath();ctx.arc(ps.x,ps.y,6,0,TAU);ctx.stroke();ctx.setLineDash([]);}
+    else{const g=ctx.createRadialGradient(ps.x,ps.y,0,ps.x,ps.y,22);g.addColorStop(0,rgba(C.sun,0.9));g.addColorStop(0.3,rgba(C.sun,0.35));g.addColorStop(1,rgba(C.sun,0));ctx.fillStyle=g;ctx.beginPath();ctx.arc(ps.x,ps.y,22,0,TAU);ctx.fill();ctx.fillStyle='#ffe7b5';ctx.beginPath();ctx.arc(ps.x,ps.y,5.5,0,TAU);ctx.fill();}
+  }
+  ctx.fillStyle=C.muted;ctx.textAlign='center';
+  ctx.fillText('北 · 塔根',cx,cy-Rp-5);ctx.fillText('南 · 塔顶',cx,cy+Rp+14);
+  ctx.textAlign='right';ctx.fillText('东',cx-Rp-4,cy+4);ctx.textAlign='left';ctx.fillText('西',cx+Rp+4,cy+4);
+  ctx.fillStyle=C.dim;ctx.textAlign='center';ctx.fillText('+',cx,cy+4);
+}
+
+/* ---------- 一年 ---------- */
+let YEAR=null;
+function computeYear(){const o=OBS();const Y=Math.round(P.Y);const el=new Float32Array(Y),dose=new Float32Array(Y);let mx=0;for(let d=0;d<Y;d++){const st=dayStats(o,d,48);el[d]=st.noonEl;dose[d]=st.dose/REF_DOSE*100;if(dose[d]>mx)mx=dose[d];}YEAR={el,dose,mx,Y};}
+function seasonColor(d,o){return season(d+0.5,o)==='冬'?C.winter:C.summer;}
+function drawYear(){
+  if(!YEAR)computeYear();
+  const o=OBS();const {ctx,w,h}=prep($('year'));const L=36,R=40,T=16,B=20;const pw=w-L-R,ph=h-T-B;const Y=YEAR.Y;const X=d=>L+d/Y*pw;
+  for(let d=0;d<Y;d++){ctx.fillStyle=seasonColor(d,o);ctx.fillRect(X(d),T-11,pw/Y+0.7,5);}
+  ctx.lineWidth=1;ctx.font=FMONO;
+  for(let v=0;v<=90;v+=30){const y=T+ph-v/90*ph;ctx.strokeStyle=C.line;ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(L+pw,y);ctx.stroke();ctx.fillStyle=C.sun;ctx.textAlign='right';ctx.fillText(v+'°',L-4,y+3);}
+  const dmx=Math.max(100,Math.ceil(YEAR.mx/50)*50);
+  ctx.textAlign='left';ctx.fillStyle=C.night;for(let i=0;i<=3;i++){const v=dmx*i/3;ctx.fillText(Math.round(v)+'%',L+pw+4,T+ph-v/dmx*ph+3);}
+  ctx.fillStyle=C.dim;ctx.textAlign='center';
+  for(let d=0;d<=Y;d+=60){const x=X(d);ctx.strokeStyle=C.line;ctx.beginPath();ctx.moveTo(x,T);ctx.lineTo(x,T+ph);ctx.stroke();ctx.fillText(String(d),x,h-5);}
+  const line=(arr,fy,col)=>{ctx.strokeStyle=col;ctx.lineWidth=1.6;ctx.beginPath();for(let d=0;d<Y;d++){const x=X(d+0.5),y=fy(arr[d]);if(d===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);}ctx.stroke();};
+  line(YEAR.dose,v=>T+ph-v/dmx*ph,C.night);
+  line(YEAR.el,v=>T+ph-v/90*ph,C.sun);
+  ctx.font=FONT;
+  const mk=(d,txt)=>{const x=X(d);ctx.strokeStyle=C.muted;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(x,T);ctx.lineTo(x,T+ph);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle=C.muted;const right=x>L+pw-60;ctx.textAlign=right?'right':'left';ctx.fillText(txt,x+(right?-3:3),T+11);};
+  mk(winterDays(),'入夏');mk(Y-JUDGE_BEFORE,'审判日');
+  const cd=S.day+S.hour/P.T;const x=X(cd);ctx.strokeStyle=C.fg;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x,T-12);ctx.lineTo(x,T+ph);ctx.stroke();
+  const di=Math.min(Y-1,Math.floor(cd));
+  ctx.fillStyle=C.sun;ctx.beginPath();ctx.arc(x,T+ph-YEAR.el[di]/90*ph,3,0,TAU);ctx.fill();
+  ctx.fillStyle=C.night;ctx.beginPath();ctx.arc(x,T+ph-YEAR.dose[di]/dmx*ph,3,0,TAU);ctx.fill();
+}
+
+/* ---------- 本月月相 ---------- */
+function drawMoonStrip(){
+  const {ctx,w,h}=prep($('moonStrip'));ctx.font=FONT;
+  if(!P.moonOn){ctx.fillStyle=C.muted;ctx.textAlign='left';ctx.fillText('月亮已关闭',4,h/2);$('moonNote').textContent='';return;}
+  const o=OBS();const t=tNow();const M=P.M;const m0=Math.floor(t/M)*M;const n=Math.round(M);const cw=w/n;const r=Math.max(3,Math.min(cw*0.4,10));let blackN=0;
+  const f=((o.ph/TAU)%1+1)%1;
+  for(let k=0;k<n;k++){
+    const tk=Math.floor(m0)+k+f;const sun=sunAt(tk),m=moonAt(tk,sun);const black=blocked(sun.x,sun.z,m.x,m.z);if(black)blackN++;
+    const sm=see(o,m);const fr=black?0:phaseFrac(o,sun,m);const rel=((tk/M)%1+1)%1;
+    const cx=cw*(k+0.5),cy=r+6;
+    drawMoonDisc(ctx,cx,cy,r,fr,rel<0.5,sm.hidden&&!black);
+    if(black){ctx.strokeStyle='#4a5470';ctx.beginPath();ctx.arc(cx,cy,r+2,0,TAU);ctx.stroke();}
+    if(Math.floor(t)===Math.floor(tk)){ctx.strokeStyle=C.sun;ctx.lineWidth=1.5;ctx.beginPath();ctx.arc(cx,cy,r+3.5,0,TAU);ctx.stroke();ctx.lineWidth=1;}
+    if(k===0||k===Math.floor(n/2)||k===n-1){ctx.fillStyle=C.dim;ctx.textAlign='center';ctx.fillText('第'+(k+1)+'夜',cx,h-6);}
+  }
+  $('moonNote').textContent='黑月 '+blackN+' 夜；黑圈是落在塔影里的那几夜';
+}
+
+/* ---------- 子午线剖面 ---------- */
+function drawMerid(){
+  const {ctx,w,h}=prep($('merid'));const L=36,R=40,T=10,B=40;const pw=w-L-R,ph=h-T-B;const maxD=Math.PI*P.R;const X=d=>L+d/maxD*pw;const t0=Math.floor(tNow());
+  const NZ=200;for(let i=0;i<NZ;i++){const d=(i+0.5)/NZ*maxD;const z=zoneOfPsi(d/P.R);ctx.fillStyle=ZCOL[z];ctx.globalAlpha=z==='tower'?0.7:0.17;ctx.fillRect(X(i/NZ*maxD),T,pw/NZ+0.7,ph);}
+  ctx.globalAlpha=1;
+  const n=120;const night=[],dose=[];let mx=0;
+  for(let i=0;i<=n;i++){const d=i/n*maxD;const o=place(d,S.obsAz);if(o.r<=P.a){night.push(null);dose.push(null);continue;}const st=dayStats(o,t0,48);night.push(st.nightLen);const ds=st.dose/REF_DOSE*100;dose.push(ds);if(ds>mx)mx=ds;}
+  const dmx=Math.max(100,Math.ceil(mx/50)*50);
+  ctx.font=FMONO;ctx.lineWidth=1;
+  const hStep=P.T<=12?2:P.T<=30?6:12;
+  for(let v=0;v<=P.T+1e-6;v+=hStep){const y=T+ph-v/P.T*ph;ctx.strokeStyle='rgba(255,255,255,0.06)';ctx.beginPath();ctx.moveTo(L,y);ctx.lineTo(L+pw,y);ctx.stroke();ctx.fillStyle=C.night;ctx.textAlign='right';ctx.fillText(v+'h',L-4,y+3);}
+  ctx.textAlign='left';ctx.fillStyle=C.sun;for(let i=0;i<=4;i++){const v=dmx*i/4;ctx.fillText(Math.round(v)+'%',L+pw+4,T+ph-v/dmx*ph+3);}
+  const eqx=X(maxD/2);ctx.strokeStyle=C.muted;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(eqx,T);ctx.lineTo(eqx,T+ph);ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle=C.dim;ctx.textAlign='center';
+  for(let km=0;km<=maxD;km+=5000){ctx.fillText(String(km),X(km),T+ph+11);}
+  const curve=(arr,fy,col)=>{ctx.strokeStyle=col;ctx.lineWidth=1.6;ctx.beginPath();let pen=false;arr.forEach((v,i)=>{if(v==null){pen=false;return;}const x=X(i/n*maxD),y=fy(v);if(!pen){ctx.moveTo(x,y);pen=true;}else ctx.lineTo(x,y);});ctx.stroke();};
+  curve(night,v=>T+ph-v/P.T*ph,C.night);
+  curve(dose,v=>T+ph-v/dmx*ph,C.sun);
+  ctx.font=FONT;
+  PRESETS.forEach((p,i)=>{const x=X(presetDist(p));const row=i%2;ctx.strokeStyle=C.dim;ctx.beginPath();ctx.moveTo(x,T+ph);ctx.lineTo(x,T+ph+14+row*12);ctx.stroke();ctx.fillStyle=C.muted;ctx.textAlign='center';ctx.fillText(p.short,x,T+ph+24+row*12);});
+  const ox=X(S.obsDist);ctx.strokeStyle='#ffffff';ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(ox,T);ctx.lineTo(ox,T+ph);ctx.stroke();
+  ctx.fillStyle=C.fg;const right=ox>L+pw-60;ctx.textAlign=right?'right':'left';ctx.fillText('观察点',ox+(right?-4:4),T+11);
+  ctx.fillStyle=C.muted;ctx.textAlign='center';ctx.fillText('赤道',eqx,T+11);
+}
+
+/* ---------- 读数 ---------- */
+function updateReadouts(){
+  const o=OBS();const t=tNow();const sun=sunAt(t);const ss=see(o,sun);
+  const g=P.gEq*o.r/P.R;const zn=zoneOfPsi(o.psi);const lat=90-o.psi/D2R;
+  const st=dayStats(o,Math.floor(t),144);const lf=localFrac(o,t);
+  const towerW=o.r>P.a?2*Math.atan(P.a/o.r)/D2R:180;
+  let sunTxt;
+  if(o.r<=P.a)sunTxt='（在塔基里）';
+  else{const F=frame(o);const ux=ss.vx/ss.dist,uy=ss.vy/ss.dist,uz=ss.vz/ss.dist;const el=Math.asin(Math.max(-1,Math.min(1,ss.sinE)))/D2R;const az=Math.atan2(ux*F.E[0]+uz*F.E[2],-uy);sunTxt=(ss.hidden?'在塔身背后':'高 '+el.toFixed(1)+'°')+'，'+dirName(az);}
+  const sea=season(t,o);
+  let moonTxt='（已关闭）';
+  if(P.moonOn){const m=moonAt(t,sun);const black=blocked(sun.x,sun.z,m.x,m.z);const sm=see(o,m);const fr=phaseFrac(o,sun,m);moonTxt=black?'黑月：落在塔影里':('亮面 '+Math.round(fr*100)+'%'+(sm.hidden?'，此刻在塔后':''));}
+  const rows=[
+    ['所在','<span class="zchip"><i style="background:'+ZCOL[zn]+'"></i>'+ZNAME[zn]+'</span>'],
+    ['重力','<span class="mono">'+g.toFixed(2)+' g</span>'],
+    ['离塔轴','<span class="mono">'+fmtKm(o.r)+'</span>'],
+    ['比赤道高','<span class="mono">'+fmtKm(P.R-o.r)+'</span>（顺着重力方向量）'],
+    ['地面倾角','<span class="mono">'+Math.abs(lat).toFixed(1)+'°</span>（地面若顺着球面）'],
+    ['头顶的塔','宽 <span class="mono">'+towerW.toFixed(1)+'°</span>'],
+    ['季节','<span class="chip '+(sea==='冬'?'w':'s')+'">'+sea+'</span>'+seasonDayText(S.day,o)],
+    ['此刻',(ss.hidden?'<span class="chip night">夜</span>':'<span class="chip day">昼</span>')+'本地 '+shichen(lf)+'（'+hhmm(lf)+'）'],
+    ['太阳',sunTxt],
+    ['昼夜','常年昼 <span class="mono">'+st.dayLen.toFixed(1)+'</span> 小时，夜 <span class="mono">'+st.nightLen.toFixed(1)+'</span> 小时'],
+    ['日照','此刻 <span class="mono">'+(irr(ss)/REF_I*100).toFixed(0)+'%</span>，全日 <span class="mono">'+(st.dose/REF_DOSE*100).toFixed(0)+'%</span>（以太阳过塔腰那天的赤道为 100%）'],
+    ['月',moonTxt]
+  ];
+  $('obsKV').innerHTML=rows.map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('');
+  $('obsNote').textContent=S.preset>=0?PRESETS[S.preset].note:'';
+  const gEqA=P.gEq*9.81;const H=287*250/gEqA/1000;
+  const ex=gEqA/(P.R*1000)*((o.r*1000)**2-(P.R*1000)**2)/(2*287*250);
+  const spin=TAU*Math.sqrt(P.R*1000/gEqA)/60;
+  $('nW').textContent=Math.round(winterDays())+' 日';$('nS').textContent=Math.round(P.Y-winterDays())+' 日';
+  $('nDay').textContent=st.dayLen.toFixed(1)+' 小时';$('nNight').textContent=st.nightLen.toFixed(1)+' 小时';
+  $('nSlope').textContent=Math.abs(lat).toFixed(0)+'°';
+  $('nH').textContent=H.toFixed(1)+' 公里';$('nHigh').textContent=fmtKm(P.R-o.r);
+  $('nAir').textContent=ex>-4.6?(Math.exp(ex)*100).toFixed(1)+'%':'e^'+Math.round(ex)+'，几乎为零';
+  $('nG').textContent=P.gEq.toFixed(2)+' g';$('nSpin').textContent=spin.toFixed(0)+' 分钟';$('nT').textContent=P.T+' 小时';
+  $('nFest').textContent=FEST?FEST.text:'';
+}
+function updateStatic(){
+  const gEqA=P.gEq*9.81;const spin=TAU*Math.sqrt(P.R*1000/gEqA)/60;
+  const eq=place(Math.PI*P.R/2,0);const eqSt=dayStats(eq,0,144);
+  const hr=hRange();
+  $('calKV').innerHTML=[
+    ['冬 / 夏','<span class="mono">'+Math.round(winterDays())+' 日 / '+Math.round(P.Y-winterDays())+' 日</span>（塔根半球）'],
+    ['太阳上下','塔根起 <span class="mono">'+Math.round((hr[0]+1)/2*100)+'%</span> 到 <span class="mono">'+Math.round((hr[1]+1)/2*100)+'%</span>（塔腰是 50%）'],
+    ['赤道昼夜','昼 <span class="mono">'+eqSt.dayLen.toFixed(1)+'</span> 小时，夜 <span class="mono">'+eqSt.nightLen.toFixed(1)+'</span> 小时'],
+    ['一年','<span class="mono">'+(P.Y/P.M).toFixed(2)+'</span> 个月']
+  ].map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('');
+  $('moonKV').innerHTML=[
+    ['黑月','每月约 <span class="mono">'+(blackFraction()*P.M).toFixed(1)+'</span> 夜'],
+    ['入冬逢黑月',FEST?FEST.text:'']
+  ].map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('');
+  $('bodyKV').innerHTML=[
+    ['自转一周','<span class="mono">'+spin.toFixed(1)+' 分钟</span>'],
+    ['塔基覆盖','离两极 <span class="mono">'+fmtKm(Math.asin(Math.min(1,P.a/P.R))*P.R)+'</span> 以内'],
+    ['轻域外缘',P.gLight<P.gEq?'离塔根 <span class="mono">'+fmtKm(Math.asin(P.gLight/P.gEq)*P.R)+'</span>':'—'],
+    ['重域起点',P.gHeavy<P.gEq?'离塔根 <span class="mono">'+fmtKm(Math.asin(P.gHeavy/P.gEq)*P.R)+'</span>':'—'],
+    ['赤道','离塔根 <span class="mono">'+fmtKm(Math.PI*P.R/2)+'</span>']
+  ].map(r=>'<dt>'+r[0]+'</dt><dd>'+r[1]+'</dd>').join('');
+}
+function updateWhen(){
+  const o=OBS();const t=tNow();const lf=localFrac(o,t);
+  const fest=isFestival(S.year+1);
+  $('yLabel').textContent='第 '+(S.year+1)+' 年';
+  $('when').innerHTML=seasonDayText(S.day,o)+'<small>入冬后第 '+(S.day+1)+' 日'+(fest?' · 下一个入冬逢黑月':'')+' · '+obsName()+' 本地 '+shichen(lf)+'</small>';
+  $('oHour').textContent=hhmm(S.hour/P.T)+'　'+shichen(S.hour/P.T);
+  $('tDay').value=S.day;$('tHour').value=S.hour;
+}
+function updateSeasonBand(){
+  const Y=P.Y;const o=OBS();const W=winterDays();
+  const cW=season(0.5,o)==='冬'?C.winter:C.summer, cS=season(W+0.5,o)==='冬'?C.winter:C.summer;
+  const wp=(W/Y*100).toFixed(2);
+  $('sband').style.background='linear-gradient(90deg,'+cW+' 0%,'+cW+' '+wp+'%,'+cS+' '+wp+'%,'+cS+' 100%)';
+  $('marks').innerHTML='<span class="mark l" style="left:0">入冬·圣皇纪念日</span><span class="mark" style="left:'+wp+'%">入夏</span><span class="mark" style="left:'+((Y-JUDGE_BEFORE)/Y*100).toFixed(2)+'%">审判日</span>';
+  let tk='';for(let d=0;d<=Y;d+=60)tk+='<span style="left:'+(d/Y*100).toFixed(2)+'%">'+d+'</span>';$('ticks').innerHTML=tk;
+  $('tDay').max=Math.round(Y)-1;
+  $('slegend').innerHTML='<span><i style="background:'+C.winter+'"></i>冬</span><span><i style="background:'+C.summer+'"></i>夏</span><span>横轴：入冬后第几日</span>';
+}
+function updateLegend(){
+  $('legend').innerHTML=[['light','轻域 < '+P.gLight.toFixed(2)+'g'],['plain','平域'],['heavy','重域 ≥ '+P.gHeavy.toFixed(2)+'g'],['limbo','灵薄 赤道 ±'+P.limboLat+'°'],['tower','巨塔']].map(z=>'<span><i style="background:'+ZCOL[z[0]]+'"></i>'+z[1]+'</span>').join('');
+}
+
+/* ---------- 参数控件 ---------- */
+const CTL={
+  cal:[
+    {k:'gap',l:'太阳离塔面',min:5,max:1500,step:5,f:v=>v+' 公里（越近，夜越长）'},
+    {k:'hAmp',l:'太阳上下的幅度',min:0.1,max:0.95,step:0.01,f:v=>'塔身的 '+Math.round(v*100)+'%'},
+    {k:'winterFrac',l:'冬占全年',min:0.25,max:0.75,step:0.01,f:v=>Math.round(v*100)+'%'},
+    {k:'Y',l:'一年（太阳上下一个来回）',min:100,max:800,step:1,f:v=>v+' 日'},
+    {k:'T',l:'一日（太阳绕塔一圈）',min:6,max:48,step:0.5,f:v=>v+' 小时'}
+  ],
+  moon:[
+    {k:'moonDist',l:'月离塔轴',min:650,max:6000,step:10,f:v=>v.toLocaleString('zh-CN')+' 公里'},
+    {k:'M',l:'一个月（太阳追上月亮一回）',min:5,max:80,step:1,f:v=>v+' 日'}
+  ],
+  body:[
+    {k:'R',l:'星体半径',min:2000,max:12000,step:10,f:v=>v.toLocaleString('zh-CN')+' 公里'},
+    {k:'a',l:'巨塔半径',min:100,max:2000,step:10,f:v=>v+' 公里'},
+    {k:'gEq',l:'赤道重力',min:0.3,max:3,step:0.01,f:v=>v.toFixed(2)+' g'},
+    {k:'gLight',l:'轻域与平域的分界',min:0.1,max:2.5,step:0.01,f:v=>v.toFixed(2)+' g'},
+    {k:'gHeavy',l:'平域与重域的分界',min:0.2,max:3,step:0.01,f:v=>v.toFixed(2)+' g'},
+    {k:'limboLat',l:'灵薄带（赤道两侧）',min:0,max:20,step:0.5,f:v=>'±'+v+'°'}
+  ]
+};
+const STRUCT=['R','a','gEq','gLight','gHeavy','limboLat'];
+function constrain(k){
+  if(P.moonDist<P.a+30)P.moonDist=P.a+30;
+  if(P.gHeavy<P.gLight+0.02){if(k==='gLight')P.gLight=P.gHeavy-0.02;else P.gHeavy=P.gLight+0.02;}
+  if(S.hour>P.T)S.hour=P.T/2;
+  if(S.day>Math.round(P.Y)-1)S.day=Math.round(P.Y)-1;
+}
+function buildCtls(id,list){
+  $(id).innerHTML=list.map(c=>'<div class="ctl"><label for="p-'+c.k+'">'+c.l+'</label><output id="o-'+c.k+'"></output><input type="range" id="p-'+c.k+'" min="'+c.min+'" max="'+c.max+'" step="'+c.step+'"></div>').join('');
+  list.forEach(c=>{const el=$('p-'+c.k);el.addEventListener('input',()=>{P[c.k]=parseFloat(el.value);constrain(c.k);el.value=P[c.k];$('o-'+c.k).textContent=c.f(P[c.k]);onParam(c.k);});});
+}
+function syncCtls(){
+  for(const g in CTL)CTL[g].forEach(c=>{const el=$('p-'+c.k);el.value=P[c.k];$('o-'+c.k).textContent=c.f(P[c.k]);});
+  $('moonOn').checked=!!P.moonOn;$('tHour').max=P.T;$('obsDist').max=Math.round(Math.PI*P.R);
+}
+let chartTimer=0,structTimer=0;
+function scheduleCharts(full){if(full)YEAR=null;clearTimeout(chartTimer);chartTimer=setTimeout(()=>{if(!YEAR)computeYear();drawYear();drawMerid();drawMoonStrip();},60);}
+function onParam(k){
+  if(STRUCT.indexOf(k)>=0){updateLegend();clearTimeout(structTimer);structTimer=setTimeout(()=>{if(three)three.rebuild();},120);if(k==='R'){$('obsDist').max=Math.round(Math.PI*P.R);if(S.obsDist>Math.PI*P.R)S.obsDist=Math.PI*P.R;if(S.preset>=0)S.obsDist=presetDist(PRESETS[S.preset]);syncObs();}}
+  if(k==='T')$('tHour').max=P.T;
+  if(three)three.rebuildPaths();
+  updateRefs();updateStatic();updateSeasonBand();lastDay=-1;refreshTime();scheduleCharts(true);save();
+}
+
+/* ---------- 观察点控件 ---------- */
+function buildPresets(){$('preset').innerHTML=PRESETS.map((p,i)=>'<option value="'+i+'">'+p.name+'</option>').join('')+'<option value="-1">自定义地点</option>';}
+function syncObs(){
+  $('preset').value=String(S.preset);
+  $('obsDist').value=S.obsDist;$('obsAz').value=S.obsAz;
+  $('oObsDist').textContent=fmtKm(S.obsDist);$('oObsAz').textContent=(S.obsAz>0?'+':'')+S.obsAz+'°';
+}
+function onObs(){syncObs();updateSeasonBand();lastDay=-1;refreshTime();scheduleCharts(true);if(three)three.markPlaces();save();}
+
+/* ---------- 时间 ---------- */
+let lastDay=-1,dirtyShade=true;
+function refreshTime(){
+  updateWhen();updateReadouts();drawSky();
+  if(YEAR)drawYear();
+  const dk=S.year*100000+S.day;if(dk!==lastDay){lastDay=dk;drawMerid();drawMoonStrip();}
+  dirtyShade=true;
+}
+
+/* ---------- 三维 ---------- */
+let three=null;
+function glowTexture(){const c=document.createElement('canvas');c.width=c.height=128;const g=c.getContext('2d');const gr=g.createRadialGradient(64,64,0,64,64,64);gr.addColorStop(0,'rgba(255,236,190,1)');gr.addColorStop(0.22,'rgba(241,182,90,0.6)');gr.addColorStop(1,'rgba(241,182,90,0)');g.fillStyle=gr;g.fillRect(0,0,128,128);return new THREE.CanvasTexture(c);}
+function initThree(){
+  const canvas=$('gl');
+  const renderer=new THREE.WebGLRenderer({canvas,antialias:true,logarithmicDepthBuffer:true});
+  renderer.setPixelRatio(Math.min(2,window.devicePixelRatio||1));
+  renderer.localClippingEnabled=true;
+  const scene=new THREE.Scene();scene.background=new THREE.Color(0x06070b);
+  const camera=new THREE.PerspectiveCamera(38,1,0.05,500);
+  const controls=new THREE.OrbitControls(camera,canvas);controls.enableDamping=true;controls.dampingFactor=0.08;controls.minDistance=2;controls.maxDistance=90;controls.enablePan=false;
+  scene.add(new THREE.AmbientLight(0xffffff,0.22));
+  const sunLight=new THREE.PointLight(0xffd59a,1.8,0,0);scene.add(sunLight);
+  const clipPlane=new THREE.Plane(new THREE.Vector3(-1,0,0),0);const clipArr=[clipPlane];
+  const world=new THREE.Group();scene.add(world);
+  const Y1=new THREE.Vector3(0,1,0),Z1=new THREE.Vector3(0,0,1);
+  const fp={on:false};
+
+  /* 大气：密度随离内壁的高度按指数变稀。视线两端各算一段光学厚度（贴地的一端最浓），
+     再按两端各自是白昼还是塔影，混进不同亮度的天光。单位一律是公里。 */
+  const ATMO={uAtmo:{value:0},uR:{value:P.R},uH:{value:40},uSigma:{value:1/200},uA:{value:P.a},uSun:{value:new THREE.Vector3()},uEyeLit:{value:1},uDay:{value:new THREE.Color('#8199c2')},uNight:{value:new THREE.Color('#070a14')}};
+  const ATMO_HEAD=[
+    'uniform float uAtmo;uniform float uR;uniform float uH;uniform float uSigma;uniform float uA;uniform vec3 uSun;uniform float uEyeLit;uniform vec3 uDay;uniform vec3 uNight;',
+    'varying vec3 vWorldPos;',
+    'float atmoEnd(vec3 X,vec3 d){float r=length(X);float h=max(0.0,uR-r);vec3 n=X/max(r,1.0);float s=max(abs(dot(d,n)),0.045);return uSigma*uH*exp(-h/uH)/s;}',
+    'float atmoRho(vec3 X){return exp(-max(0.0,uR-length(X))/uH);}',
+    'bool atmoShadow(vec3 X){vec2 a=X.xz;vec2 dd=uSun.xz-a;float t=clamp(-dot(a,dd)/max(dot(dd,dd),1e-6),0.0,1.0);vec2 c=a+t*dd;return dot(c,c)<uA*uA*0.998;}',
+    ''
+  ].join('\n');
+  const ATMO_FRAG=[
+    'if(uAtmo>0.5){',
+    '  vec3 E=cameraPosition*1000.0;vec3 X=vWorldPos*1000.0;vec3 dv=X-E;float L=length(dv);vec3 dir=dv/max(L,1e-3);',
+    '  float ta=atmoEnd(E,dir);float tb=atmoEnd(X,-dir);',
+    '  float cap=uSigma*L*max(atmoRho(E),atmoRho(X));float sc=min(1.0,cap/max(ta+tb,1e-6));ta*=sc;tb*=sc;',
+    '  vec3 sa=uEyeLit>0.5?uDay:uNight;vec3 sb=atmoShadow(X)?uNight:uDay;',
+    '  float TA=exp(-ta);float TB=exp(-tb);',
+    '  gl_FragColor.rgb=gl_FragColor.rgb*TA*TB+sb*(1.0-TB)*TA+sa*(1.0-TA);',
+    '}'
+  ].join('\n');
+  function patch(mat){
+    mat.onBeforeCompile=function(sh){
+      Object.assign(sh.uniforms,ATMO);
+      sh.vertexShader='varying vec3 vWorldPos;\n'+sh.vertexShader.replace('#include <project_vertex>','#include <project_vertex>\n\tvWorldPos=(modelMatrix*vec4(transformed,1.0)).xyz;');
+      sh.fragmentShader=ATMO_HEAD+sh.fragmentShader.replace('#include <fog_fragment>','#include <fog_fragment>\n'+ATMO_FRAG);
+    };
+    return mat;
+  }
+  function atmoDepthTo(o,b){ // 观察者看某个远在真空里的天体时，近端那段大气的光学厚度
+    const vx=b.x-o.x,vy=b.y-o.y,vz=b.z-o.z;const L=Math.hypot(vx,vy,vz);const r=Math.hypot(o.x,o.y,o.z);
+    const s=Math.max(0.045,Math.abs((vx*o.x+vy*o.y+vz*o.z)/(L*r)));const h=2.5;
+    return (1/S.fp.V)*S.fp.H*Math.exp(-h/S.fp.H)/s;
+  }
+
+  let shell=null,shellGeo=null,V=null,tower=null,deco=null,paths=null;
+  const placeGroup=new THREE.Group();scene.add(placeGroup);
+  function circleGeo(n){const pts=[];for(let k=0;k<=n;k++){const t=k/n*TAU;pts.push(new THREE.Vector3(Math.cos(t),0,Math.sin(t)));}return new THREE.BufferGeometry().setFromPoints(pts);}
+  function rebuild(){
+    if(shell){world.remove(shell);shellGeo.dispose();shell.material.dispose();}
+    if(tower){world.remove(tower);tower.geometry.dispose();tower.material.dispose();}
+    if(deco){world.remove(deco);deco.traverse(o=>{if(o.geometry)o.geometry.dispose();});}
+    ATMO.uR.value=P.R;ATMO.uA.value=P.a;
+    shellGeo=new THREE.SphereGeometry(P.R*U,200,130);
+    const pos=shellGeo.attributes.position.array,n=pos.length/3;
+    shellGeo.setAttribute('color',new THREE.BufferAttribute(new Float32Array(n*3),3));
+    V={n,x:new Float32Array(n),y:new Float32Array(n),z:new Float32Array(n),r:new Float32Array(n),base:new Float32Array(n*3),tw:new Uint8Array(n)};
+    const tmp=new THREE.Color();
+    for(let i=0;i<n;i++){const x=pos[3*i]/U,y=pos[3*i+1]/U,z=pos[3*i+2]/U;V.x[i]=x;V.y[i]=y;V.z[i]=z;V.r[i]=Math.hypot(x,z);const psi=Math.acos(Math.max(-1,Math.min(1,-y/P.R)));const zn=zoneOfPsi(psi);V.tw[i]=zn==='tower'?1:0;tmp.set(ZCOL[zn]);V.base[3*i]=tmp.r;V.base[3*i+1]=tmp.g;V.base[3*i+2]=tmp.b;}
+    shell=new THREE.Mesh(shellGeo,patch(new THREE.MeshBasicMaterial({vertexColors:true,side:THREE.DoubleSide,clippingPlanes:clipArr})));
+    applyClipMaterial();
+    world.add(shell);
+    tower=new THREE.Mesh(new THREE.CylinderGeometry(P.a*U,P.a*U,2*P.R*U*1.08,128,1,false),patch(new THREE.MeshLambertMaterial({color:0x0c0c0f})));
+    world.add(tower);
+    deco=new THREE.Group();world.add(deco);
+    const lmat=(col,op)=>new THREE.LineBasicMaterial({color:col,transparent:true,opacity:op,clippingPlanes:clipArr});
+    const ring=(psi,mat)=>{const r=P.R*Math.sin(psi)*U*0.996,y=-P.R*Math.cos(psi)*U*0.996;const l=new THREE.Line(circleGeo(160),mat);l.scale.set(r,1,r);l.position.y=y;deco.add(l);};
+    const gmat=lmat(0xffffff,0.07);
+    for(let d=15;d<180;d+=15)ring(d*D2R,gmat);
+    for(let m=0;m<12;m++){const ph=m*30*D2R;const pts=[];for(let k=0;k<=120;k++){const psi=k/120*Math.PI;const r=P.R*Math.sin(psi)*U*0.996;pts.push(new THREE.Vector3(r*Math.cos(ph),-P.R*Math.cos(psi)*U*0.996,r*Math.sin(ph)));}deco.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),gmat));}
+    const bmat=lmat(0xf1b65a,0.45);
+    [P.gLight,P.gHeavy].forEach(g=>{if(g<P.gEq){const psi=Math.asin(g/P.gEq);ring(psi,bmat);ring(Math.PI-psi,bmat);}});
+    const vmat=lmat(0xc0aee6,0.45);ring((90-P.limboLat)*D2R,vmat);ring((90+P.limboLat)*D2R,vmat);
+    const wl=new THREE.Line(circleGeo(96),new THREE.LineBasicMaterial({color:0xc3cddd,transparent:true,opacity:0.8}));wl.scale.set(P.a*U*1.01,1,P.a*U*1.01);deco.add(wl);
+    deco.visible=!fp.on;
+    rebuildPaths();markPlaces();dirtyShade=true;
+  }
+  // 太阳的螺旋（示意：只画十几圈）与月亮在塔腰的轨道
+  function rebuildPaths(){
+    if(paths){scene.remove(paths);paths.traverse(o=>{if(o.geometry)o.geometry.dispose();});}
+    paths=new THREE.Group();scene.add(paths);
+    const hr=hRange();const d=(P.a+P.gap)*U;const turns=14;const pts=[];const N=turns*48;
+    for(let k=0;k<=N;k++){const f=k/N;const th=f*turns*TAU;const y=(hr[0]+(hr[1]-hr[0])*f)*P.R*U;pts.push(new THREE.Vector3(d*Math.cos(th),y,d*Math.sin(th)));}
+    paths.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts),new THREE.LineBasicMaterial({color:0xf1b65a,transparent:true,opacity:0.16})));
+    if(P.moonOn){const mo=new THREE.Line(circleGeo(160),new THREE.LineBasicMaterial({color:0xc3cddd,transparent:true,opacity:0.3}));mo.scale.set(P.moonDist*U,1,P.moonDist*U);paths.add(mo);}
+    paths.visible=!fp.on;
+  }
+  function applyClipMaterial(){if(!shell)return;const m=shell.material;const solid=S.clip||fp.on;m.transparent=!solid;m.opacity=solid?1:0.22;m.depthWrite=solid;m.needsUpdate=true;}
+  const sunMesh=new THREE.Mesh(new THREE.SphereGeometry(0.11,24,16),patch(new THREE.MeshBasicMaterial({color:0xffe3ad})));scene.add(sunMesh);
+  const glow=new THREE.Sprite(new THREE.SpriteMaterial({map:glowTexture(),blending:THREE.AdditiveBlending,transparent:true,depthWrite:false}));glow.scale.set(1.7,1.7,1);scene.add(glow);
+  const sunOrbit=new THREE.Line(circleGeo(128),new THREE.LineBasicMaterial({color:0xf1b65a,transparent:true,opacity:0.55}));scene.add(sunOrbit);
+  const moonMesh=new THREE.Mesh(new THREE.SphereGeometry(0.085,32,20),patch(new THREE.MeshLambertMaterial({color:0xc3cddd})));scene.add(moonMesh);
+  const groundMat=patch(new THREE.MeshBasicMaterial({color:0x333333,side:THREE.DoubleSide}));
+  const ground=new THREE.Mesh(new THREE.CircleGeometry(1.2,160),groundMat);ground.visible=false;scene.add(ground);
+  const rayGeo=new THREE.BufferGeometry();rayGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(12),3));
+  const rays=new THREE.LineSegments(rayGeo,new THREE.LineDashedMaterial({color:0xf1b65a,dashSize:0.2,gapSize:0.14,transparent:true,opacity:0.75}));scene.add(rays);
+  const dropGeo=new THREE.BufferGeometry();dropGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(6),3));
+  const drop=new THREE.LineSegments(dropGeo,new THREE.LineDashedMaterial({color:0xf1b65a,dashSize:0.12,gapSize:0.12,transparent:true,opacity:0.35}));scene.add(drop);
+  const obsMesh=new THREE.Mesh(new THREE.ConeGeometry(0.1,0.38,16),new THREE.MeshBasicMaterial({color:0xffffff}));scene.add(obsMesh);
+  const cutRing=new THREE.Line(circleGeo(200),new THREE.LineBasicMaterial({color:0x3b4459}));scene.add(cutRing);
+  const box=$('labels');const labels={};
+  const mk=(key,text,cls,onShell)=>{const el=document.createElement('div');el.className='lbl '+(cls||'');el.textContent=text;box.appendChild(el);labels[key]={el,pos:new THREE.Vector3(),onShell:!!onShell};};
+  mk('root','塔根 · 北极','pole');mk('top','塔顶 · 南极','pole');mk('waist','塔腰','pole');mk('sun','太阳','sun');mk('moon','月','moon');mk('obs','','obs',true);
+  PRESETS.forEach((p,i)=>mk('p'+i,p.short,'place',true));
+  mk('cN','北','compass');mk('cE','东','compass');mk('cS','南','compass');mk('cW','西','compass');
+  function markPlaces(){
+    while(placeGroup.children.length){const c=placeGroup.children.pop();c.geometry.dispose();}
+    PRESETS.forEach((p,i)=>{const o=place(presetDist(p),p.az);const up=new THREE.Vector3(-Math.cos(o.ph),0,-Math.sin(o.ph));const m=new THREE.Mesh(new THREE.SphereGeometry(0.05,10,8),new THREE.MeshBasicMaterial({color:0xddd6c4}));m.position.set(o.x*U,o.y*U,o.z*U).addScaledVector(up,0.03);placeGroup.add(m);labels['p'+i].pos.copy(m.position);labels['p'+i].km={x:o.x,z:o.z};labels['p'+i].skip=(i===S.preset);});
+  }
+  function shade(sun){
+    const col=shellGeo.attributes.color.array;const R2=P.R*P.R;const n=V.n;
+    for(let i=0;i<n;i++){
+      const j=3*i;if(V.tw[i]){col[j]=col[j+1]=col[j+2]=0.015;continue;}
+      const x=V.x[i],z=V.z[i];
+      if(!blocked(x,z,sun.x,sun.z)){const vx=sun.x-x,vy=sun.y-V.y[i],vz=sun.z-z;const d2=vx*vx+vy*vy+vz*vz;const sinE=(-x*vx-z*vz)/(V.r[i]*Math.sqrt(d2));const I=Math.max(0,sinE)*R2/d2;const f=0.3+0.7*Math.min(1,Math.sqrt(I/REF_I));col[j]=V.base[j]*f+0.05*f;col[j+1]=V.base[j+1]*f+0.032*f;col[j+2]=V.base[j+2]*f;}
+      else{col[j]=V.base[j]*0.08+0.012;col[j+1]=V.base[j+1]*0.08+0.018;col[j+2]=V.base[j+2]*0.08+0.05;}
+    }
+    shellGeo.attributes.color.needsUpdate=true;
+  }
+  function setFP(on){
+    fp.on=on;controls.enabled=!on;
+    [rays,drop,sunOrbit,cutRing,obsMesh,placeGroup].forEach(o=>{o.visible=!on;});
+    if(paths)paths.visible=!on;if(deco)deco.visible=!on;
+    ground.visible=on;$('fpbar').hidden=!on;$('cross').hidden=!on;$('stage').classList.toggle('fp',on);
+    if(on){camera.near=0.0005;camera.far=40;camera.fov=S.fp.fov;glow.scale.set(0.9,0.9,1);}
+    else{camera.near=0.05;camera.far=500;camera.fov=38;camera.up.set(0,1,0);scene.background.set(0x06070b);ATMO.uAtmo.value=0;glow.scale.set(1.7,1.7,1);glow.material.opacity=1;}
+    camera.updateProjectionMatrix();applyClipMaterial();dirtyShade=true;resize();
+  }
+  function setView(v){
+    S.view=v;
+    document.querySelectorAll('[data-view]').forEach(b=>b.setAttribute('aria-pressed',String(b.dataset.view===v)));
+    setFP(v==='fp');
+    if(v!=='fp'){
+      const D=P.R*U;const asp=camera.aspect||1.5;const k=asp<1?1/Math.pow(asp,0.7):1;
+      const map={oblique:[1.7,0.62,1.4],top:[0.04,3.1,0.04],side:[2.7,0.02,0.05],bottom:[0.04,-3.1,0.04]};
+      const p=map[v]||map.oblique;camera.position.set(p[0]*D*k,p[1]*D*k,p[2]*D*k);controls.target.set(0,0,0);controls.update();
+    }
+    save();
+  }
+  function resize(){const r=$('stage').getBoundingClientRect();const w=Math.max(10,r.width),h=Math.max(10,r.height);renderer.setSize(w,h,false);camera.aspect=w/h;const top=document.querySelector('.hud').offsetHeight+12;const bot=document.querySelector('.timebar').offsetHeight+12;const mid=(top+(h-bot))/2;camera.setViewOffset(w,h,0,Math.round(fp.on?0:h/2-mid),w,h);camera.updateProjectionMatrix();}
+  new ResizeObserver(resize).observe($('stage'));resize();
+
+  // 第一人称：拖动转头，滚轮缩放
+  let drag=null;
+  canvas.addEventListener('pointerdown',e=>{if(!fp.on)return;drag={x:e.clientX,y:e.clientY};try{canvas.setPointerCapture(e.pointerId);}catch(err){}});
+  canvas.addEventListener('pointermove',e=>{if(!fp.on||!drag)return;const k=0.18*S.fp.fov/72;S.fp.yaw=((S.fp.yaw-(e.clientX-drag.x)*k)%360+360)%360;S.fp.pitch=Math.max(-15,Math.min(88,S.fp.pitch+(e.clientY-drag.y)*k));drag={x:e.clientX,y:e.clientY};});
+  const endDrag=()=>{if(drag){drag=null;save();}};
+  canvas.addEventListener('pointerup',endDrag);canvas.addEventListener('pointercancel',endDrag);
+  canvas.addEventListener('wheel',e=>{if(!fp.on)return;e.preventDefault();S.fp.fov=Math.max(10,Math.min(110,S.fp.fov+e.deltaY*0.04));camera.fov=S.fp.fov;camera.updateProjectionMatrix();save();},{passive:false});
+  document.querySelectorAll('[data-look]').forEach(b=>b.addEventListener('click',()=>{
+    const L=b.dataset.look;
+    if(L==='sun'){const o=OBS();const sun=sunAt(tNow());const ss=see(o,sun);const Fr=frame(o);const ux=ss.vx/ss.dist,uy=ss.vy/ss.dist,uz=ss.vz/ss.dist;S.fp.yaw=(Math.atan2(ux*Fr.E[0]+uz*Fr.E[2],-uy)/D2R+360)%360;S.fp.pitch=Math.max(-15,Math.min(88,Math.asin(Math.max(-1,Math.min(1,ss.sinE)))/D2R));}
+    else{const m={N:[0,12],E:[90,12],S:[180,12],W:[270,12],Z:[S.fp.yaw,88]};S.fp.yaw=m[L][0];S.fp.pitch=m[L][1];}
+    save();
+  }));
+  const vMap=v=>10*Math.pow(300,v/100),vInv=km=>Math.log(km/10)/Math.log(300)*100;
+  const hMap=v=>2*Math.pow(150,v/100),hInv=km=>Math.log(km/2)/Math.log(150)*100;
+  function syncAtmoUI(){
+    $('fpAtmo').checked=!!S.fp.atmo;$('fpV').value=vInv(S.fp.V);$('fpH').value=hInv(S.fp.H);
+    $('oFpV').textContent=Math.round(S.fp.V)+' 公里';$('oFpH').textContent=S.fp.H<10?S.fp.H.toFixed(1)+' 公里':Math.round(S.fp.H)+' 公里';
+    $('fpV').disabled=$('fpH').disabled=!S.fp.atmo;
+  }
+  $('fpAtmo').addEventListener('change',()=>{S.fp.atmo=$('fpAtmo').checked;syncAtmoUI();save();});
+  $('fpV').addEventListener('input',()=>{S.fp.V=vMap(parseFloat($('fpV').value));syncAtmoUI();save();});
+  $('fpH').addEventListener('input',()=>{S.fp.H=hMap(parseFloat($('fpH').value));syncAtmoUI();save();});
+  syncAtmoUI();
+
+  const nrm=new THREE.Vector3(),tmpV=new THREE.Vector3(),Uv=new THREE.Vector3(),Nv=new THREE.Vector3(),Ev=new THREE.Vector3(),base=new THREE.Vector3(),eye=new THREE.Vector3(),dirV=new THREE.Vector3(),gcol=new THREE.Color();
+  let readTimer=0;
+  function frameUpdate(){
+    const t=tNow();const sun=sunAt(t);const o=OBS();
+    ATMO.uSun.value.set(sun.x,sun.y,sun.z);
+    if(fp.on){
+      const c=Math.cos(o.ph),s=Math.sin(o.ph);
+      Uv.set(-c,0,-s);Nv.set(0,-1,0);Ev.set(s,0,-c);
+      base.set(o.x*U,o.y*U,o.z*U);eye.copy(base).addScaledVector(Uv,0.0025);
+      ground.position.copy(base).addScaledVector(Uv,0.0012);ground.quaternion.setFromUnitVectors(Z1,Uv);
+      const yaw=S.fp.yaw*D2R,p=S.fp.pitch*D2R;
+      dirV.copy(Nv).multiplyScalar(Math.cos(p)*Math.cos(yaw)).addScaledVector(Ev,Math.cos(p)*Math.sin(yaw)).addScaledVector(Uv,Math.sin(p));
+      camera.up.copy(Uv);camera.position.copy(eye);camera.lookAt(tmpV.copy(eye).add(dirV));
+      if(camera.fov!==S.fp.fov){camera.fov=S.fp.fov;camera.updateProjectionMatrix();}
+      clipPlane.normal.set(0,-1,0);clipPlane.constant=1000;
+      const ss=see(o,sun);const lit=!ss.hidden;
+      ATMO.uEyeLit.value=lit?1:0;ATMO.uAtmo.value=S.fp.atmo?1:0;ATMO.uSigma.value=1/S.fp.V;ATMO.uH.value=S.fp.H;
+      scene.background.set(S.fp.atmo?(lit?'#8199c2':'#070a14'):'#000000');
+      const k=lit?Math.min(1,Math.sqrt(irr(ss)/REF_I)):0;
+      gcol.set(ZCOL[zoneOfPsi(o.psi)]||'#555555').multiplyScalar(lit?0.3+0.45*k:0.06);groundMat.color.copy(gcol);
+      glow.material.opacity=S.fp.atmo?Math.exp(-atmoDepthTo(o,sun)):1;
+    }else{
+      controls.update();
+      nrm.copy(camera.position).normalize();
+      clipPlane.normal.copy(nrm).negate();clipPlane.constant=S.clip?0:1000;
+      cutRing.visible=S.clip;cutRing.scale.setScalar(P.R*U*1.002);cutRing.quaternion.setFromUnitVectors(Y1,nrm);
+      ATMO.uAtmo.value=0;
+    }
+    if(dirtyShade&&V){shade(sun);dirtyShade=false;}
+    sunMesh.position.set(sun.x*U,sun.y*U,sun.z*U);glow.position.copy(sunMesh.position);sunLight.position.copy(sunMesh.position);
+    if(!fp.on){
+      sunOrbit.position.set(0,sun.y*U,0);sunOrbit.scale.set(sun.d*U,1,sun.d*U);
+      const d=Math.hypot(sun.x,sun.z);const beta=Math.acos(Math.min(1,P.a/d));const arr=rayGeo.attributes.position.array;let k=0;
+      [1,-1].forEach(sg=>{const ang=sun.th+sg*beta;const tx=P.a*Math.cos(ang),tz=P.a*Math.sin(ang);let dx=tx-sun.x,dz=tz-sun.z;const L=Math.hypot(dx,dz)||1;dx/=L;dz/=L;const b=sun.x*dx+sun.z*dz;const cc=d*d-P.R*P.R;const tt=-b+Math.sqrt(Math.max(0,b*b-cc));arr[k++]=sun.x*U;arr[k++]=0;arr[k++]=sun.z*U;arr[k++]=(sun.x+dx*tt)*U;arr[k++]=0;arr[k++]=(sun.z+dz*tt)*U;});
+      rayGeo.attributes.position.needsUpdate=true;rayGeo.computeBoundingSphere();rays.computeLineDistances();
+      const da=dropGeo.attributes.position.array;da[0]=sun.x*U;da[1]=sun.y*U;da[2]=sun.z*U;da[3]=sun.x*U;da[4]=0;da[5]=sun.z*U;dropGeo.attributes.position.needsUpdate=true;dropGeo.computeBoundingSphere();drop.computeLineDistances();
+    }
+    moonMesh.visible=!!P.moonOn;
+    if(P.moonOn){const m=moonAt(t,sun);const black=blocked(sun.x,sun.z,m.x,m.z);moonMesh.position.set(m.x*U,m.y*U,m.z*U);moonMesh.material.color.set(black?0x15181f:0xc3cddd);labels.moon.pos.copy(moonMesh.position);labels.moon.el.textContent=black?'月（黑月）':'月';}
+    const up=new THREE.Vector3(-Math.cos(o.ph),0,-Math.sin(o.ph));
+    obsMesh.position.set(o.x*U,o.y*U,o.z*U).addScaledVector(up,0.19);obsMesh.quaternion.setFromUnitVectors(Y1,up);
+    labels.obs.el.textContent=obsName();labels.obs.pos.copy(obsMesh.position).addScaledVector(up,0.15);
+    const poleK=fp.on?0.985:1.1;
+    labels.root.pos.set(0,-P.R*U*poleK,0);labels.top.pos.set(0,P.R*U*poleK,0);labels.waist.pos.set(P.a*U*1.05,0,P.a*U*0.3);labels.sun.pos.copy(sunMesh.position);
+    if(fp.on){labels.cN.pos.copy(eye).addScaledVector(Nv,30);labels.cS.pos.copy(eye).addScaledVector(Nv,-30);labels.cE.pos.copy(eye).addScaledVector(Ev,30);labels.cW.pos.copy(eye).addScaledVector(Ev,-30);}
+    const r=$('stage').getBoundingClientRect();const w=r.width,h=r.height;
+    for(const key in labels){const Lb=labels[key];
+      let vis;
+      if(fp.on){
+        vis=key!=='waist'&&key!=='obs'&&!(key==='moon'&&!P.moonOn)&&!Lb.skip;
+        if(vis&&key.charAt(0)!=='c'){tmpV.copy(Lb.pos).sub(eye);if(tmpV.dot(Uv)<0)vis=false;}
+        if(vis&&Lb.km&&blocked(o.x,o.z,Lb.km.x,Lb.km.z))vis=false;
+      }else{
+        vis=key.charAt(0)!=='c'&&!(key==='moon'&&!P.moonOn)&&!Lb.skip;
+      }
+      if(vis){tmpV.copy(Lb.pos).project(camera);vis=tmpV.z<1&&tmpV.z>-1&&Math.abs(tmpV.x)<1.05&&Math.abs(tmpV.y)<1.05;if(vis&&!fp.on&&Lb.onShell&&S.clip&&Lb.pos.dot(nrm)>0.05)vis=false;}
+      Lb.el.style.visibility=vis?'visible':'hidden';
+      if(vis){Lb.el.style.left=((tmpV.x+1)/2*w)+'px';Lb.el.style.top=((1-tmpV.y)/2*h)+'px';}}
+    if(fp.on){
+      tmpV.copy(eye).add(dirV).project(camera);const cr=$('cross');cr.style.left=((tmpV.x+1)/2*w)+'px';cr.style.top=((1-tmpV.y)/2*h)+'px';
+      const now=performance.now();
+      if(now-readTimer>150){readTimer=now;
+        let txt='视线 '+dirName(S.fp.yaw*D2R)+'，仰角 '+S.fp.pitch.toFixed(0)+'°，视野 '+S.fp.fov.toFixed(0)+'°。';
+        if(S.fp.atmo){const up2=Math.exp(-2*S.fp.H/S.fp.V);txt+='抬头看对面的世界，大约透过 '+Math.round(up2*100)+'% 的光。';}
+        else txt+='真空：对面的世界一览无余。';
+        $('fpRead').textContent=txt;}
+    }
+    renderer.render(scene,camera);
+  }
+  rebuild();
+  return {rebuild,rebuildPaths,setView,frame:frameUpdate,markPlaces,applyClip:applyClipMaterial,resize};
+}
+
+/* ---------- 启动 ---------- */
+function init(){
+  buildPresets();
+  buildCtls('ctl-cal',CTL.cal);buildCtls('ctl-moon',CTL.moon);buildCtls('ctl-body',CTL.body);
+  syncCtls();syncObs();updateLegend();updateRefs();updateStatic();updateSeasonBand();
+  $('speed').value=String(S.speed);if(!$('speed').value)$('speed').value='1';
+  try{if(!window.THREE||!THREE.OrbitControls)throw new Error('three 未加载');three=initThree();three.setView(S.view||'oblique');}
+  catch(e){three=null;$('stage').insertAdjacentHTML('beforeend','<div class="err">三维视图没有加载出来（需要联网取 three.js）。右侧的读数和图表照常可用。</div>');}
+  $('clipBtn').setAttribute('aria-pressed',String(S.clip));
+  $('preset').addEventListener('change',()=>{const i=parseInt($('preset').value,10);S.preset=i;if(i>=0){S.obsDist=Math.round(presetDist(PRESETS[i]));S.obsAz=PRESETS[i].az;}onObs();});
+  $('obsDist').addEventListener('input',()=>{S.obsDist=parseFloat($('obsDist').value);S.preset=-1;onObs();});
+  $('obsAz').addEventListener('input',()=>{S.obsAz=parseFloat($('obsAz').value);S.preset=-1;onObs();});
+  $('tDay').addEventListener('input',()=>{S.day=parseInt($('tDay').value,10);refreshTime();save();});
+  $('tHour').addEventListener('input',()=>{S.hour=parseFloat($('tHour').value);refreshTime();save();});
+  $('yPrev').addEventListener('click',()=>{S.year=Math.max(0,S.year-1);refreshTime();save();});
+  $('yNext').addEventListener('click',()=>{S.year=Math.min(999,S.year+1);refreshTime();save();});
+  $('play').addEventListener('click',()=>{S.playing=!S.playing;$('play').textContent=S.playing?'暂停':'播放';$('play').setAttribute('aria-pressed',String(S.playing));});
+  $('speed').addEventListener('change',()=>{S.speed=parseFloat($('speed').value);save();});
+  $('moonOn').addEventListener('change',()=>{P.moonOn=$('moonOn').checked;if(three)three.rebuildPaths();lastDay=-1;refreshTime();save();});
+  document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>{if(three)three.setView(b.dataset.view);}));
+  $('clipBtn').addEventListener('click',()=>{S.clip=!S.clip;$('clipBtn').setAttribute('aria-pressed',String(S.clip));if(three)three.applyClip();save();});
+  $('reset').addEventListener('click',()=>{P=Object.assign({},DEF);const keepView=S.view;S=Object.assign({},SDEF);S.fp=Object.assign({},SDEF.fp);S.playing=false;S.view=keepView;$('play').textContent='播放';$('play').setAttribute('aria-pressed','false');$('speed').value='1';syncCtls();syncObs();updateLegend();updateRefs();updateStatic();updateSeasonBand();if(three)three.rebuild();lastDay=-1;refreshTime();scheduleCharts(true);save();});
+  window.addEventListener('resize',()=>{lastDay=-1;refreshTime();scheduleCharts(false);});
+  lastDay=-1;refreshTime();scheduleCharts(true);
+  let last=performance.now();
+  function loop(now){
+    const dt=Math.min(0.1,(now-last)/1000);last=now;
+    if(S.playing){const Yr=Math.round(P.Y);let t=S.year*Yr+S.day+S.hour/P.T+dt*S.speed;S.year=Math.floor(t/Yr);const rem=t-S.year*Yr;S.day=Math.floor(rem);S.hour=(rem-S.day)*P.T;refreshTime();}
+    if(three)three.frame();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+}
+init();
+})();
+</script>

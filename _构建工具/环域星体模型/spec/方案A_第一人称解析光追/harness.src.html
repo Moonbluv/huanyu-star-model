@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>方案A 着色器试验台</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#ddd;font:12px/1.4 system-ui,"Microsoft YaHei",sans-serif;overflow:hidden}
+#c{position:fixed;inset:0;width:100%;height:100%;display:block}
+#hud{position:fixed;left:8px;top:8px;background:rgba(0,0,0,.55);padding:6px 8px;border-radius:4px;white-space:pre;pointer-events:none;max-width:60vw}
+</style></head><body>
+<canvas id="c"></canvas><div id="hud"></div>
+<script id="glsl-common" type="x-shader">/*COMMON*/</script>
+<script id="glsl-main" type="x-shader">/*MAIN*/</script>
+<script id="glsl-probe" type="x-shader">/*PROBE*/</script>
+<script id="glsl-mslut" type="x-shader">/*MSLUT*/</script>
+<script id="glsl-post" type="x-shader">/*POST*/</script>
+<script>
+'use strict';
+const TAU = Math.PI * 2, D2R = Math.PI / 180;
+const $ = id => document.getElementById(id);
+const src = id => $(id).textContent;
+const cv = $('c');
+const gl = cv.getContext('webgl2', { antialias: false, alpha: false, depth: false, preserveDrawingBuffer: true });
+const LOG = [];
+function log(s) { LOG.push(s); console.log(s); }
+if (!gl) { document.body.innerHTML = '<p style="color:#f88;padding:20px">没有 WebGL2</p>'; throw new Error('no webgl2'); }
+const extCBF = gl.getExtension('EXT_color_buffer_float');
+gl.getExtension('OES_texture_float_linear');
+const extPar = gl.getExtension('KHR_parallel_shader_compile');
+
+// ---------------- 参数 ----------------
+const P = {
+  R: 6371, a: 600, gEq: 1.4, gLight: 0.75, gHeavy: 1.2, limboKm: 330,
+  Y: 360, M: 32, rs: 640, rm: 6371 / 2, A: 6371 / 2, rhoS: 20, rhoM: 100,
+  sunLux: 128000, sunRef: 5731,
+  HR: 40, HM: 6, V: 200, mieG: 0.76, atmo: 1,
+  mode: 1, W: 1.5, Hc: 99, cliff: 0.07, wig: 0.35, cliffJit: 0.07, veil: 0, disp: 1.0, abyssDepth: 30, abyssHalf: 220,
+  cloud: 1, cloudBase: 1.5, cloudTop: 6.5, cover: 0.42, cloudSigma: 22, ruiOvercast: 1.0, ruiRad: 900, rain: 0.03, wet: 0.7,
+  towerAlb: 0.0, moonAlb: 0.12,
+  s: 6670, lon: -4, eye: 0.0017, yaw: 180, pitch: 10, fov: 70,
+  t: 3 * 360 + 295 + 0.5 + 4 / 360, EV: 0, lock: 0, lockEV: 12, purkinje: 1, adaptMin: 0.003, adaptMax: 1e5,
+  scale: 0.5, quality: 'mid', frames: 0, bloom: 0.02
+};
+const QUALITY = {
+  low:  { Q_ATM_NEAR: 8,  Q_ATM_FAR: 6,  Q_TER_STEPS: 56,  Q_NEAR_KM: '40.0',  Q_SHADOW_STEPS: 10, Q_CLOUD_STEPS: 16, Q_CLOUD_LIGHT: 2 },
+  mid:  { Q_ATM_NEAR: 14, Q_ATM_FAR: 10, Q_TER_STEPS: 96,  Q_NEAR_KM: '80.0',  Q_SHADOW_STEPS: 20, Q_CLOUD_STEPS: 32, Q_CLOUD_LIGHT: 4 },
+  high: { Q_ATM_NEAR: 24, Q_ATM_FAR: 16, Q_TER_STEPS: 160, Q_NEAR_KM: '150.0', Q_SHADOW_STEPS: 32, Q_CLOUD_STEPS: 64, Q_CLOUD_LIGHT: 6 }
+};
+
+// ---------------- 天体（方案乙：日月对称双螺旋） ----------------
+function sunAt(t) { const lam = Math.PI + TAU * t; return [P.rs * Math.cos(lam), P.A * Math.sin(TAU * t / P.Y), P.rs * Math.sin(lam)]; }
+function moonAt(t) { const lam = TAU * t * (1 - 1 / P.M); return [P.rm * Math.cos(lam), -P.A * Math.sin(TAU * t / P.Y), P.rm * Math.sin(lam)]; }
+
+// ---------------- 向量 ----------------
+const v3 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], add: (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]],
+  mul: (a, s) => [a[0] * s, a[1] * s, a[2] * s], dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  len: a => Math.hypot(a[0], a[1], a[2]), norm: a => { const l = Math.hypot(a[0], a[1], a[2]); return [a[0] / l, a[1] / l, a[2] / l]; } };
+const smooth = (a, b, x) => { const u = Math.min(1, Math.max(0, (x - a) / (b - a))); return u * u * (3 - 2 * u); };
+
+// CPU 版遮挡（与着色器同式）
+function bodyVisTower(X, S, rho) {
+  const px = X[0], pz = X[2], rp2 = px * px + pz * pz, a2 = P.a * P.a;
+  if (rp2 <= a2) return 0;
+  const rp = Math.sqrt(rp2), qx = S[0] - px, qz = S[2] - pz, Lh = Math.hypot(qx, qz);
+  if (Lh < 1e-3) return 1;
+  const cx = -px / rp, cz = -pz / rp, cosA = (qx * cx + qz * cz) / Lh;
+  if (cosA <= 0) return 1;
+  const sinA = Math.abs(cx * qz - cz * qx) / Lh, sd = P.a / rp, cd = Math.sqrt(Math.max(0, 1 - sd * sd));
+  const u = Lh * (sinA * cd - cosA * sd) / rho;
+  if (u >= 1) return 1;
+  if (sinA < sd) { const tHit = rp * cosA - Math.sqrt(Math.max(a2 - rp2 * sinA * sinA, 0)); if (Lh < tHit) return 1; }
+  else if (Lh < rp * cd) return 1;
+  if (u <= -1) return 0;
+  return 0.5 + (u * Math.sqrt(1 - u * u) + Math.asin(u)) / Math.PI;
+}
+
+// ---------------- 程序噪声 ----------------
+function hash2(i, j, s) { let h = (i * 374761393 + j * 668265263 + s * 2147483647) | 0; h = (h ^ (h >>> 13)) * 1274126177 | 0; h = h ^ (h >>> 16); return (h >>> 0) / 4294967296; }
+function hash3(i, j, k, s) { let h = (i * 374761393 + j * 668265263 + k * 1440662683 + s * 2654435761) | 0; h = (h ^ (h >>> 13)) * 1274126177 | 0; h = h ^ (h >>> 16); return (h >>> 0) / 4294967296; }
+const fade5 = t => t * t * t * (t * (t * 6 - 15) + 10);
+function perlin2(x, y, per, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+  const g = (i, j) => { const a = hash2(((i % per) + per) % per, ((j % per) + per) % per, seed) * TAU; return [Math.cos(a), Math.sin(a)]; };
+  const d = (i, j, dx, dy) => { const gg = g(i, j); return gg[0] * dx + gg[1] * dy; };
+  const u = fade5(xf), v = fade5(yf);
+  const n00 = d(xi, yi, xf, yf), n10 = d(xi + 1, yi, xf - 1, yf), n01 = d(xi, yi + 1, xf, yf - 1), n11 = d(xi + 1, yi + 1, xf - 1, yf - 1);
+  return (n00 + u * (n10 - n00) + v * (n01 - n00) + u * v * (n00 - n10 - n01 + n11)) * 1.414;
+}
+function makeHeight(N) {
+  const H = new Float32Array(N * N), M = new Float32Array(N * N);
+  const F = 32;  // 32 个特征/平铺
+  let mn = 1e9, mx = -1e9;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = i / N, y = j / N;
+    let f = 0, a = 1, per = F, ridge = 0;
+    for (let o = 0; o < 4; o++) { const n = perlin2(x * per, y * per, per, 11 + o); f += a * n; ridge += a * (1 - Math.abs(n)); a *= 0.5; per *= 2; }
+    const h = 0.55 * f + 0.45 * (ridge - 0.9);
+    H[j * N + i] = h; mn = Math.min(mn, h); mx = Math.max(mx, h);
+    let m = 0; a = 1; per = 16;
+    for (let o = 0; o < 3; o++) { m += a * perlin2(x * per, y * per, per, 77 + o); a *= 0.5; per *= 2; }
+    M[j * N + i] = 0.5 + 0.5 * m;
+  }
+  const out = new Float32Array(N * N * 4);
+  for (let k = 0; k < N * N; k++) H[k] = 2 * (H[k] - mn) / (mx - mn) - 1;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const k = j * N + i, ip = j * N + (i + 1) % N, im = j * N + (i + N - 1) % N, jp = ((j + 1) % N) * N + i, jm = ((j + N - 1) % N) * N + i;
+    out[4 * k] = H[k]; out[4 * k + 1] = (H[ip] - H[im]) * 0.5 * N; out[4 * k + 2] = (H[jp] - H[jm]) * 0.5 * N; out[4 * k + 3] = Math.min(1, Math.max(0, M[k]));
+  }
+  return { N, data: out, H };
+}
+function sampleH(T, u, v) {  // 与 GL LINEAR+REPEAT 一致
+  const N = T.N; let x = u * N - 0.5, y = v * N - 0.5;
+  const x0 = Math.floor(x), y0 = Math.floor(y), fx = x - x0, fy = y - y0;
+  const g = (i, j) => T.H[(((j % N) + N) % N) * N + (((i % N) + N) % N)];
+  return (g(x0, y0) * (1 - fx) + g(x0 + 1, y0) * fx) * (1 - fy) + (g(x0, y0 + 1) * (1 - fx) + g(x0 + 1, y0 + 1) * fx) * fy;
+}
+function make3D(N) {
+  const out = new Uint8Array(N * N * N * 4);
+  const worley = (x, y, z, cells, seed) => {
+    const xi = Math.floor(x * cells), yi = Math.floor(y * cells), zi = Math.floor(z * cells);
+    let best = 9;
+    for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const cx = xi + dx, cy = yi + dy, cz = zi + dz;
+      const wx = ((cx % cells) + cells) % cells, wy = ((cy % cells) + cells) % cells, wz = ((cz % cells) + cells) % cells;
+      const px = (cx + hash3(wx, wy, wz, seed)) / cells, py = (cy + hash3(wx, wy, wz, seed + 1)) / cells, pz = (cz + hash3(wx, wy, wz, seed + 2)) / cells;
+      const d = Math.hypot(px - x, py - y, pz - z) * cells; if (d < best) best = d;
+    }
+    return Math.max(0, 1 - best);
+  };
+  const perlin3 = (x, y, z, per, seed) => {
+    const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), xf = x - xi, yf = y - yi, zf = z - zi;
+    const gr = (i, j, k) => { i = ((i % per) + per) % per; j = ((j % per) + per) % per; k = ((k % per) + per) % per;
+      const th = hash3(i, j, k, seed) * TAU, zz = hash3(i, j, k, seed + 9) * 2 - 1, r = Math.sqrt(1 - zz * zz); return [r * Math.cos(th), r * Math.sin(th), zz]; };
+    const dd = (i, j, k, dx, dy, dz) => { const g = gr(i, j, k); return g[0] * dx + g[1] * dy + g[2] * dz; };
+    const u = fade5(xf), v = fade5(yf), w = fade5(zf);
+    const L = (a, b, t) => a + (b - a) * t;
+    return L(L(L(dd(xi, yi, zi, xf, yf, zf), dd(xi + 1, yi, zi, xf - 1, yf, zf), u), L(dd(xi, yi + 1, zi, xf, yf - 1, zf), dd(xi + 1, yi + 1, zi, xf - 1, yf - 1, zf), u), v),
+             L(L(dd(xi, yi, zi + 1, xf, yf, zf - 1), dd(xi + 1, yi, zi + 1, xf - 1, yf, zf - 1), u), L(dd(xi, yi + 1, zi + 1, xf, yf - 1, zf - 1), dd(xi + 1, yi + 1, zi + 1, xf - 1, yf - 1, zf - 1), u), v), w);
+  };
+  for (let k = 0; k < N; k++) for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const x = (i + 0.5) / N, y = (j + 0.5) / N, z = (k + 0.5) / N;
+    let p = 0, a = 1, per = 4, an = 0;
+    for (let o = 0; o < 3; o++) { p += a * perlin3(x * per, y * per, z * per, per, 3 + o); an += a; a *= 0.5; per *= 2; }
+    p = 0.5 + 0.5 * p / an * 1.6;
+    const w1 = worley(x, y, z, 4, 101), w2 = worley(x, y, z, 8, 202), w3 = worley(x, y, z, 16, 303);
+    const pw = Math.min(1, Math.max(0, p * 0.65 + (w1 * 0.625 + w2 * 0.25 + w3 * 0.125) * 0.45 - 0.05));
+    const o4 = 4 * (k * N * N + j * N + i);
+    out[o4] = pw * 255; out[o4 + 1] = w1 * 255; out[o4 + 2] = w2 * 255; out[o4 + 3] = w3 * 255;
+  }
+  return out;
+}
+
+// ---------------- GL 小工具 ----------------
+const VS = '#version 300 es\nvoid main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0.0,1.0);}';
+function compile(type, s, name) {
+  const sh = gl.createShader(type); gl.shaderSource(sh, s); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) { const e = gl.getShaderInfoLog(sh); log('编译失败 ' + name + ':\n' + e); throw new Error(name + ': ' + e); }
+  return sh;
+}
+function program(fs, name) {
+  const p = gl.createProgram(); gl.attachShader(p, compile(gl.VERTEX_SHADER, VS, 'vs')); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs, name)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { const e = gl.getProgramInfoLog(p); log('链接失败 ' + name + ': ' + e); throw new Error(e); }
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); const nm = info.name.replace(/\[0\]$/, ''); u[nm] = gl.getUniformLocation(p, info.name); }
+  return { p, u, name };
+}
+function defs(q) { return Object.entries(q).map(([k, v]) => '#define ' + k + ' ' + v).join('\n') + '\n'; }
+function tex2D(w, h, internal, format, type, data, filter, wrap) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, data || null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, wrap); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, wrap);
+  return t;
+}
+function rt(w, h, filter) {
+  const t = tex2D(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, null, filter || gl.LINEAR, gl.CLAMP_TO_EDGE);
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { t, f, w, h };
+}
+
+// ---------------- 资源 ----------------
+let T0 = performance.now();
+const HM = makeHeight(512);
+const texH = tex2D(512, 512, gl.RGBA16F, gl.RGBA, gl.FLOAT, HM.data, gl.LINEAR, gl.REPEAT);
+log('高度图 ' + (performance.now() - T0).toFixed(0) + ' ms'); T0 = performance.now();
+const N3 = 64, n3data = make3D(N3);
+const tex3 = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, tex3);
+gl.texImage3D(gl.TEXTURE_3D, 0, gl.RGBA8, N3, N3, N3, 0, gl.RGBA, gl.UNSIGNED_BYTE, n3data);
+gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+[gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R].forEach(w => gl.texParameteri(gl.TEXTURE_3D, w, gl.REPEAT));
+log('三维噪声 ' + (performance.now() - T0).toFixed(0) + ' ms');
+
+const rtMS = rt(32, 32), rtProbe = rt(32, 16, gl.NEAREST), rtSH = rt(9, 1, gl.NEAREST);
+const rtExp = [rt(1, 1, gl.NEAREST), rt(1, 1, gl.NEAREST)];
+const texBlack = tex2D(1, 1, gl.RGBA16F, gl.RGBA, gl.FLOAT, new Float32Array(4), gl.NEAREST, gl.CLAMP_TO_EDGE);
+let rtHDR = null;
+let progs = {};
+function buildPrograms() {
+  const q = defs(QUALITY[P.quality]);
+  const head = '#version 300 es\n' + q;
+  const T = performance.now();
+  progs.main = program(head + src('glsl-common') + '\n' + src('glsl-main'), 'main');
+  progs.probe = program(head + src('glsl-common') + '\n' + src('glsl-probe'), 'probe');
+  progs.ms = program(head + src('glsl-common') + '\n' + src('glsl-mslut'), 'mslut');
+  progs.sh = program('#version 300 es\n#define PASS_SH\n' + src('glsl-post'), 'sh');
+  progs.expo = program('#version 300 es\n#define PASS_EXPO\n' + src('glsl-post'), 'expo');
+  progs.fin = program('#version 300 es\n#define PASS_FINAL\n' + src('glsl-post'), 'final');
+  progs.taa = program('#version 300 es\n#define PASS_TAA\n' + src('glsl-post'), 'taa');
+  progs.bd = program('#version 300 es\n#define PASS_BLOOM_DOWN\n' + src('glsl-post'), 'bd');
+  progs.bu = program('#version 300 es\n#define PASS_BLOOM_UP\n' + src('glsl-post'), 'bu');
+  log('编译 ' + (performance.now() - T).toFixed(0) + ' ms（' + P.quality + '）');
+}
+
+// ---------------- 场景量 ----------------
+const LAYER_L = [6.0, 1.1, 0.2, 0.035, 0.006], LAYER_A = [0.32, 0.085, 0.018, 0.0032, 0.0007], TF = 32;
+function trench(y) { return P.abyssDepth * (1 - smooth(P.abyssHalf * 0.55, P.abyssHalf, Math.abs(y))); }
+function sawS(f) { return (f - 0.5) - smooth(1 - P.cliff, 1, f); }
+const fract = x => x - Math.floor(x);
+const fr = Math.fround;
+function scene() {
+  const R = P.R, psi = P.s / R, lam = P.lon * D2R;
+  const ySph = -R * Math.cos(psi);
+  const rS = R * Math.sin(psi);
+  const g = P.gEq * rS / R;
+  const zw = [1 - smooth(P.gLight - 0.04, P.gLight + 0.04, g), 0, smooth(P.gHeavy - 0.04, P.gHeavy + 0.04, g), 0];
+  zw[1] = Math.max(0, 1 - zw[0] - zw[2]);
+  const ruiDir = (() => { const ps = 6670 / R, la = -4 * D2R; return [Math.sin(ps) * Math.cos(la), -Math.cos(ps), Math.sin(ps) * Math.sin(la)]; })();
+  const ruiRad = P.ruiRad / R;
+  const dirP = [Math.sin(psi) * Math.cos(lam), -Math.cos(psi), Math.sin(psi) * Math.sin(lam)];
+  const cdR = v3.dot(dirP, ruiDir);
+  zw[3] = smooth(Math.cos(ruiRad), Math.cos(ruiRad * 0.75), cdR);
+  const limboW = 1 - smooth(P.limboKm * 0.8, P.limboKm, Math.abs(ySph));
+  let zoneAmp = (zw[0] * 1.6 + zw[1] * 0.7 + zw[2] * 1.0);
+  zoneAmp = zoneAmp * (1 - zw[3]) + 1.25 * zw[3];
+  zoneAmp = zoneAmp * (1 - limboW) + 0.4 * limboW;
+  const amp = zoneAmp * P.disp;
+  // 噪声原点（相机全球地表坐标，双精度取模）
+  const cg = [-rS * lam, -P.s];
+  const org = [];
+  for (let k = 0; k < 5; k++) {
+    const an = k * 1.31, c = Math.cos(an), s = Math.sin(an), sc = 1 / (LAYER_L[k] * TF);
+    org.push(fract((c * cg[0] - s * cg[1]) * sc), fract((s * cg[0] + c * cg[1]) * sc));
+  }
+  let D = 0;
+  for (let k = 0; k < 5; k++) D += LAYER_A[k] * amp * sampleH(HM, org[2 * k], org[2 * k + 1]);
+  // 阶地：有符号崖高（不超过踏面宽 × tan 纬度，赤道附近自然消失）
+  const tanLat = Math.abs(ySph) / Math.max(rS, 1);
+  const HcS = (ySph < 0 ? 1 : -1) * Math.min(P.Hc, P.W * tanLat);
+  const wigS = 1 / (10 * P.W * TF);
+  const wigOrg = [fract(cg[0] * wigS), fract(cg[1] * wigS)];
+  const w0 = sampleH(HM, wigOrg[0], wigOrg[1]);
+  const b0 = sampleH(HM, org[2], org[3]);
+  const camF = fract(ySph / P.W + P.wig * w0 + P.cliffJit * b0);
+  let Pc;
+  if (P.mode === 1) {
+    const y = ySph;
+    const rb = Math.sqrt(R * R - y * y) - HcS * sawS(camF) + trench(y);
+    const r = rb - (D + P.eye);
+    Pc = [r * Math.cos(lam), y, r * Math.sin(lam)];
+  } else {
+    const rho = R + trench(ySph) - (D + P.eye);
+    Pc = v3.mul(dirP, rho);
+  }
+  Pc = Pc.map(fr);
+  const rho = v3.len(Pc), r0 = Math.hypot(Pc[0], Pc[2]), yP = Pc[1];
+  const rsP = Math.sqrt(R * R - yP * yP);
+  const altS = R + trench(yP) - rho;
+  const altT = rsP - HcS * sawS(camF) + trench(yP) - r0;
+  const U = [-Pc[0] / r0, 0, -Pc[2] / r0], Nn = [0, -1, 0], E = v3.cross(Nn, U);
+  const yaw = P.yaw * D2R, pit = Math.min(89.5, Math.max(-89.5, P.pitch)) * D2R;
+  const fwd = v3.add(v3.mul(v3.add(v3.mul(Nn, Math.cos(yaw)), v3.mul(E, Math.sin(yaw))), Math.cos(pit)), v3.mul(U, Math.sin(pit)));
+  const right = v3.norm(v3.cross(fwd, U)), up = v3.cross(right, fwd);
+  // 日月
+  const S = sunAt(P.t), Mo = moonAt(P.t);
+  const sunCol = [1.0, 0.97, 0.92]; const sl = 0.2126 * sunCol[0] + 0.7152 * sunCol[1] + 0.0722 * sunCol[2];
+  const sunI = sunCol.map(c => c / sl * P.sunLux * P.sunRef * P.sunRef);
+  // 大气系数
+  const betaR = [5.802e-3, 13.558e-3, 33.1e-3];
+  const bM = Math.max(3.912 / P.V - betaR[1], 0);
+  const betaM = bM * 0.9, betaMA = bM * 0.1;
+  const hcut = Math.min(12 * Math.max(P.HR, P.HM), 1500);
+  const ambK = betaR.map(b => { const tau = b * P.HR + bM * P.HM; return 0.55 * (1 - Math.exp(-tau)); });
+  // 月：照度（Lambert 球相位积分 × 月心塔影可见度）、壁照（L1）、本体系
+  const toObs = v3.sub(Pc, Mo), Dm = v3.len(toObs), toSun = v3.sub(S, Mo), Ds = v3.len(toSun);
+  const phi = Math.acos(Math.max(-1, Math.min(1, v3.dot(toObs, toSun) / (Dm * Ds))));
+  const visM = bodyVisTower(Mo, S, P.rhoS);
+  const Esm = P.sunLux * (P.sunRef / Ds) ** 2;
+  let W0 = [0, 0, 0], W1 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  { // 壁照：内壁 400 个面元
+    const NQ = 400; let F = 0; const V = [0, 0, 0];
+    for (let i = 0; i < NQ; i++) {
+      const z = 1 - 2 * (i + 0.5) / NQ, ph = i * 2.39996323, rr = Math.sqrt(1 - z * z);
+      const Wp = [R * rr * Math.cos(ph), R * z, R * rr * Math.sin(ph)];
+      if (Math.hypot(Wp[0], Wp[2]) < P.a) continue;
+      const nW = v3.mul(Wp, -1 / R);
+      const ls = v3.sub(S, Wp), dS = v3.len(ls), muS = v3.dot(ls, nW) / dS;
+      if (muS <= 0) continue;
+      const vis = bodyVisTower(Wp, S, P.rhoS); if (vis <= 0) continue;
+      const Ew = P.sunLux * (P.sunRef / dS) ** 2 * muS * vis * 0.7;
+      const Lw = 0.16 / Math.PI * Ew;
+      const toM = v3.sub(Mo, Wp), dM = v3.len(toM), cw = v3.dot(toM, nW) / dM;
+      if (cw <= 0 || bodyVisTower(Mo, Wp, 1) < 0.5) continue;
+      const dOm = 4 * Math.PI * R * R / NQ * cw / (dM * dM);
+      const om = v3.mul(toM, -1 / dM);
+      F += Lw * dOm; V[0] += Lw * dOm * om[0]; V[1] += Lw * dOm * om[1]; V[2] += Lw * dOm * om[2];
+    }
+    W0 = [0.25 * F, 0.25 * F, 0.25 * F];
+    W1 = [0.5 * V[0], 0.5 * V[1], 0.5 * V[2]];
+  }
+  const nOM = v3.mul(toObs, 1 / Dm);
+  const Ewo = Math.max(0, W0[0] + W1[0] * nOM[0] + W1[1] * nOM[1] + W1[2] * nOM[2]);
+  const moonLux = (2 / 3) * P.moonAlb * Esm * visM * (P.rhoM / Dm) ** 2 * (Math.sin(phi) + (Math.PI - phi) * Math.cos(phi)) / Math.PI
+               + P.moonAlb * Ewo * (P.rhoM / Dm) ** 2;
+  const mAx = v3.norm([-Mo[0], 0, -Mo[2]]), mUp = [0, 1, 0], mT = v3.cross(mAx, mUp);
+  return { Pc, rho, r0, yP, rsP, altS, altT, HcS, U, Nn, E, fwd, right, up, S, Mo, sunI, betaR, betaM, betaMA, hcut, ambK,
+           zw, limboW, zoneAmp, org, ruiDir, wigS, wigOrg, w0, camF, b0, ruiRad, moonLux, Dm, W0, W1, mAx, mUp, mT, visM, phi, D, amp };
+}
+
+function setCommon(pr, sc, w, h) {
+  const u = pr.u; const f1 = (n, v) => u[n] && gl.uniform1f(u[n], v); const f3 = (n, v) => u[n] && gl.uniform3f(u[n], v[0], v[1], v[2]);
+  if (u.uRes) gl.uniform2f(u.uRes, w, h);
+  if (u.uJitter) gl.uniform2f(u.uJitter, 0, 0);
+  if (u.uFrame) gl.uniform1i(u.uFrame, P.frames);
+  f1('uClock', performance.now() / 1000);
+  f3('uCamPos', sc.Pc); f3('uCamRight', sc.right); f3('uCamUp', sc.up); f3('uCamFwd', sc.fwd);
+  f1('uTanHalfFov', Math.tan(P.fov * D2R / 2));
+  f1('uCamC0', sc.rho * sc.rho - P.R * P.R); f1('uCamRho', sc.rho); f1('uCamR0', sc.r0);
+  f1('uCamAltS', sc.altS); f1('uCamAltT', sc.altT); f1('uRsphP', sc.rsP); f1('uCamFy', sc.camF); f1('uTerWig', P.wig); f1('uWigS', sc.wigS); f1('uW0', sc.w0); f1('uB0', sc.b0); f1('uCliffJit', P.cliffJit); if (u.uWigOrg) gl.uniform2f(u.uWigOrg, sc.wigOrg[0], sc.wigOrg[1]); f1('uVeilK', P.veil / 1000); f1('uTrenchP', trench(sc.yP));
+  f3('uFrameE', sc.E); f3('uFrameN', sc.Nn); f3('uFrameU', sc.U);
+  if (u.uLayerOrg) gl.uniform2fv(u.uLayerOrg, new Float32Array(sc.org));
+  f1('uZoneAmp', sc.zoneAmp); if (u.uZoneW) gl.uniform4f(u.uZoneW, sc.zw[0], sc.zw[1], sc.zw[2], sc.zw[3]);
+  f1('uLimboW', sc.limboW);
+  f1('uLip', 1.2 * LAYER_A.reduce((acc, A, k) => acc + 3 * A / LAYER_L[k], 0) * sc.amp + 0.05);
+  f1('uClearMax', (LAYER_A.reduce((a, b) => a + b, 0)) * sc.amp + 0.6 * Math.abs(sc.HcS) + 0.02);
+  f1('uR', P.R); f1('uA', P.a); f1('uGEq', P.gEq); f1('uGLight', P.gLight); f1('uGHeavy', P.gHeavy); f1('uLimboKm', P.limboKm);
+  f3('uSunPos', sc.S); f1('uSunRad', P.rhoS); f3('uSunI', sc.sunI);
+  f3('uMoonPos', sc.Mo); f1('uMoonRad', P.rhoM); f1('uMoonAlb', P.moonAlb);
+  if (u.uMoonBasis) gl.uniformMatrix3fv(u.uMoonBasis, false, new Float32Array([...sc.mAx, ...sc.mUp, ...sc.mT]));
+  f3('uMoonW0', sc.W0);
+  if (u.uMoonW1) gl.uniformMatrix3fv(u.uMoonW1, false, new Float32Array([sc.W1[0], sc.W1[0], sc.W1[0], sc.W1[1], sc.W1[1], sc.W1[1], sc.W1[2], sc.W1[2], sc.W1[2]]));
+  f3('uMoonE', [sc.moonLux, sc.moonLux, sc.moonLux]); f1('uMoonD2', sc.Dm * sc.Dm);
+  f1('uAtmoOn', P.atmo); f3('uBetaR', sc.betaR); f1('uBetaM', sc.betaM); f1('uBetaMA', sc.betaMA);
+  f1('uHR', P.HR); f1('uHM', P.HM); f1('uMieG', P.mieG); f1('uHcut', sc.hcut); f1('uRainBeta', P.rain); f3('uAmbK', sc.ambK);
+  if (u.uGroundMode) gl.uniform1i(u.uGroundMode, P.mode);
+  if (u.uDebug) gl.uniform1i(u.uDebug, P.debug || 0);
+  f1('uTerW', P.W); f1('uHcS', sc.HcS); f1('uCliffFrac', P.cliff); f1('uDispScale', P.disp);
+  f1('uAbyssDepth', P.abyssDepth); f1('uAbyssHalf', P.abyssHalf); f3('uRuiDir', sc.ruiDir); f1('uRuiRad', sc.ruiRad); f1('uWet', P.wet);
+  f1('uCloudOn', P.cloud); f1('uCloudBase', P.cloudBase); f1('uCloudTop', P.cloudTop); f1('uCloudCover', P.cover); f1('uCloudSigma', P.cloudSigma); f1('uRuiOvercast', P.ruiOvercast);
+  f3('uWind', [P.t * 0.9, P.t * 0.13, 0.25 * Math.sin(P.t * 0.05)]);
+  f1('uTowerAlb', P.towerAlb);
+  // 纹理单元
+  const bindT = (name, unit, target, t) => { if (u[name]) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(target, t); gl.uniform1i(u[name], unit); } };
+  bindT('uMSLut', 0, gl.TEXTURE_2D, rtMS.t); bindT('uSkySH', 1, gl.TEXTURE_2D, rtSH.t); bindT('uHeightTex', 2, gl.TEXTURE_2D, texH);
+  bindT('uNoise3D', 3, gl.TEXTURE_3D, tex3); bindT('uExpTex', 4, gl.TEXTURE_2D, rtExp[expIdx].t);
+}
+
+let expIdx = 0, lastT = performance.now(), msDirty = true;
+function draw(target, w, h) { gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.f : null); gl.viewport(0, 0, w, h); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+const vao = gl.createVertexArray();
+function resize() {
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  const W = Math.round(cv.clientWidth * dpr), H = Math.round(cv.clientHeight * dpr);
+  if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+  const rw = Math.max(16, Math.round(W * P.scale)), rh = Math.max(16, Math.round(H * P.scale));
+  if (!rtHDR || rtHDR.w !== rw || rtHDR.h !== rh) rtHDR = rt(rw, rh, gl.LINEAR);
+}
+let bloomDown = [], bloomUp = [];
+function ensureBloom() {
+  if (bloomDown.length && bloomDown[0].w === Math.max(1, rtHDR.w >> 1) && bloomDown[0].h === Math.max(1, rtHDR.h >> 1)) return;
+  bloomDown = []; bloomUp = [];
+  let w = rtHDR.w, h = rtHDR.h;
+  for (let i = 0; i < 5; i++) { w = Math.max(1, w >> 1); h = Math.max(1, h >> 1); bloomDown.push(rt(w, h, gl.LINEAR)); if (i < 4) bloomUp.push(rt(w, h, gl.LINEAR)); }
+}
+function runBloom() {
+  ensureBloom();
+  let srcT = rtHDR;
+  gl.useProgram(progs.bd.p);
+  for (let i = 0; i < 5; i++) {
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, srcT.t); gl.uniform1i(progs.bd.u.uSrc, 0);
+    gl.uniform2f(progs.bd.u.uSrcTexel, 1 / srcT.w, 1 / srcT.h); gl.uniform1f(progs.bd.u.uFirst, i === 0 ? 1 : 0);
+    draw(bloomDown[i], bloomDown[i].w, bloomDown[i].h); srcT = bloomDown[i];
+  }
+  gl.useProgram(progs.bu.p);
+  let cur = bloomDown[4];
+  for (let i = 3; i >= 0; i--) {
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, cur.t); gl.uniform1i(progs.bu.u.uSrc, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bloomDown[i].t); gl.uniform1i(progs.bu.u.uBase, 1);
+    gl.uniform2f(progs.bu.u.uSrcTexel, 1 / cur.w, 1 / cur.h); gl.uniform1f(progs.bu.u.uW, 1.0);
+    draw(bloomUp[i], bloomUp[i].w, bloomUp[i].h); cur = bloomUp[i];
+  }
+  return cur;
+}
+let gpuMs = 0, timer = gl.getExtension('EXT_disjoint_timer_query_webgl2'), q = null;
+function frame(adaptFully) {
+  resize();
+  gl.bindVertexArray(vao);
+  const sc = scene();
+  if (msDirty) { gl.useProgram(progs.ms.p); setCommon(progs.ms, sc, 32, 32); draw(rtMS, 32, 32); msDirty = false; }
+  // 探针 → SH
+  gl.useProgram(progs.probe.p); setCommon(progs.probe, sc, 32, 16); draw(rtProbe, 32, 16);
+  gl.useProgram(progs.sh.p); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtProbe.t); gl.uniform1i(progs.sh.u.uProbe, 0); draw(rtSH, 9, 1);
+  // 主 pass
+  if (timer && !q) { q = gl.createQuery(); gl.beginQuery(timer.TIME_ELAPSED_EXT, q); }
+  gl.useProgram(progs.main.p); setCommon(progs.main, sc, rtHDR.w, rtHDR.h); draw(rtHDR, rtHDR.w, rtHDR.h);
+  if (timer && q && !q._ended) { gl.endQuery(timer.TIME_ELAPSED_EXT); q._ended = true; }
+  // 曝光
+  const now = performance.now(); const dt = adaptFully ? 30 : Math.min(0.2, (now - lastT) / 1000); lastT = now;
+  gl.useProgram(progs.expo.p);
+  const ue = progs.expo.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtHDR.t); gl.uniform1i(ue.uHDR, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, rtExp[expIdx].t); gl.uniform1i(ue.uPrev, 1);
+  gl.uniform1f(ue.uDt, dt); gl.uniform1f(ue.uEV, P.EV); gl.uniform1f(ue.uAdaptMin, P.adaptMin); gl.uniform1f(ue.uAdaptMax, P.adaptMax);
+  gl.uniform1f(ue.uLock, P.lock); gl.uniform1f(ue.uLockEV, P.lockEV);
+  draw(rtExp[1 - expIdx], 1, 1); expIdx = 1 - expIdx;
+  // 眩光
+  const bl = P.bloom > 0 ? runBloom() : null;
+  // 输出
+  gl.useProgram(progs.fin.p); const uf = progs.fin.u;
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, rtHDR.t); gl.uniform1i(uf.uHDR, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, bl ? bl.t : texBlack); gl.uniform1i(uf.uBloom, 1);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, rtExp[expIdx].t); gl.uniform1i(uf.uExpo, 2);
+  gl.uniform2f(uf.uOutRes, cv.width, cv.height); gl.uniform1f(uf.uBloomK, P.bloom); gl.uniform1f(uf.uPurkinje, P.purkinje);
+  draw(null, cv.width, cv.height);
+  P.frames++;
+  if (timer && q && q._ended) { if (gl.getQueryParameter(q, gl.QUERY_RESULT_AVAILABLE)) { gpuMs = gl.getQueryParameter(q, gl.QUERY_RESULT) / 1e6; gl.deleteQuery(q); q = null; } }
+  return sc;
+}
+function readExpo() { gl.bindFramebuffer(gl.FRAMEBUFFER, rtExp[expIdx].f); const b = new Float32Array(4); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, b); return b; }
+function readSH() { gl.bindFramebuffer(gl.FRAMEBUFFER, rtSH.f); const b = new Float32Array(36); gl.readPixels(0, 0, 9, 1, gl.RGBA, gl.FLOAT, b); return b; }
+function readCenterLum() { gl.bindFramebuffer(gl.FRAMEBUFFER, rtHDR.f); const b = new Float32Array(4); gl.readPixels(rtHDR.w >> 1, rtHDR.h >> 1, 1, 1, gl.RGBA, gl.FLOAT, b); return b; }
+
+// ---------------- 交互 ----------------
+let drag = null;
+cv.addEventListener('pointerdown', e => { drag = [e.clientX, e.clientY]; });
+addEventListener('pointerup', () => drag = null);
+addEventListener('pointermove', e => { if (!drag) return; const k = 0.15 * P.fov / 70; P.yaw = (P.yaw - (e.clientX - drag[0]) * k + 360) % 360; P.pitch = Math.max(-89, Math.min(89, P.pitch + (e.clientY - drag[1]) * k)); drag = [e.clientX, e.clientY]; });
+cv.addEventListener('wheel', e => { e.preventDefault(); P.fov = Math.max(5, Math.min(120, P.fov + e.deltaY * 0.03)); }, { passive: false });
+addEventListener('keydown', e => { if (e.key === ',') P.t -= 1 / 96; if (e.key === '.') P.t += 1 / 96; });
+
+let running = true;
+function loop() { if (running) { try { frame(false); hud(); } catch (e) { log(String(e)); running = false; } } requestAnimationFrame(loop); }
+function hud() {
+  const lt = ((P.t - P.lon * D2R / TAU) % 1 + 1) % 1;
+  $('hud').textContent = `s=${P.s} lon=${P.lon} 本地时 ${(lt * 24).toFixed(2)}h  第${Math.floor(P.t % P.Y)}日  yaw ${P.yaw.toFixed(0)} pitch ${P.pitch.toFixed(0)} fov ${P.fov.toFixed(0)}\n` +
+    `GPU 主 pass ${gpuMs.toFixed(1)} ms  ${rtHDR.w}×${rtHDR.h}  ${P.quality}\n` + LOG.slice(-3).join('\n');
+}
+// 测试接口
+window.app = {
+  P, log: LOG, set(o) { Object.assign(P, o); if ('HR' in o || 'HM' in o || 'V' in o || 'mieG' in o) msDirty = true; if ('quality' in o) buildPrograms(); },
+  settle(n) { for (let i = 0; i < (n || 6); i++) frame(true); hud(); return readExpo(); },
+  readSH, readExpo, readCenterLum, scene, readPx(fx, fy) { gl.bindFramebuffer(gl.FRAMEBUFFER, rtHDR.f); const b = new Float32Array(4); gl.readPixels(Math.round(fx * (rtHDR.w - 1)), Math.round(fy * (rtHDR.h - 1)), 1, 1, gl.RGBA, gl.FLOAT, b); const e = readExpo(); return { L: [b[0] / e[0], b[1] / e[0], b[2] / e[0]], t: b[3] }; }, pause() { running = false; }, resume() { running = true; },
+  localNoon(day, frac) { return day + (frac == null ? 0.5 : frac) + P.lon / 360; }
+};
+// 测量辅助：太阳/月亮方位、水平面天空照度（由 SH 算）、若干像素亮度
+app.lookAt = function (t, extra) {
+  app.set(Object.assign({ t }, extra || {})); const sc = scene();
+  const f = Q => { const d = v3.sub(Q, sc.Pc), L = v3.len(d); return { el: Math.asin(v3.dot(d, sc.U) / L) / D2R, az: ((Math.atan2(v3.dot(d, sc.E), v3.dot(d, sc.Nn)) / D2R) + 360) % 360, L }; };
+  return { sun: f(sc.S), moon: f(sc.Mo), visM: sc.visM, phi: sc.phi / D2R, moonLux: sc.moonLux };
+};
+app.Eh = function (n) {
+  const s = readSH(), c = i => s[4 * i + 1], sc = scene(); n = n || sc.U; const x = n[0], y = n[1], z = n[2];
+  const c1 = 0.429043, c2 = 0.511664, c3 = 0.743125, c4 = 0.886227, c5 = 0.247708;
+  return c1 * c(8) * (x * x - y * y) + c3 * c(6) * z * z + c4 * c(0) - c5 * c(6) + 2 * c1 * (c(4) * x * y + c(7) * x * z + c(5) * y * z) + 2 * c2 * (c(3) * x + c(1) * y + c(2) * z);
+};
+app.lumAt = (fx, fy) => { const v = app.readPx(fx, fy); return +(0.2126 * v.L[0] + 0.7152 * v.L[1] + 0.0722 * v.L[2]).toPrecision(3); };
+app.measure = function (t, extra) {
+  const r = app.lookAt(t, Object.assign({ yaw: 90, pitch: 89.4, fov: 60, cloud: 0, rain: 0, wet: 0 }, extra || {})); const e = app.settle(10);
+  return { r, expo: e[0], adapt: e[1], band: app.lumAt(0.5, 0.5), side20: app.lumAt(0.7, 0.5), side40: app.lumAt(0.9, 0.5), Esky: +app.Eh().toPrecision(3) };
+};
+try { buildPrograms(); } catch (e) { running = false; }
+requestAnimationFrame(loop);
+</script></body></html>
